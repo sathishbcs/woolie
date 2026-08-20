@@ -1,4 +1,4 @@
-#!/bin/bash
+​#!/bin/bash
 trap "exit 1" TERM
 export TOP_PID=$$
 
@@ -3135,6 +3135,22 @@ SQL_EOF
 ts="$(date +%Y%m%d_%H%M%S)"
 TMP_SQL="${script_dir}/hana_statement_hash_${ts}.sql"
 OUTPUT_FILE="${script_dir}/hana_statement_hash_${ts}.out"
+ERR_FILE="${script_dir}/hana_statement_hash_${ts}.err"
+
+# --- optional: use an external SQL template instead of the embedded one, e.g.
+#     the revision-specific variant downloaded from SAP Note 1969700.
+#     If the file still contains the __BEGIN_TIME__ / __END_TIME__ /
+#     __STATEMENT_HASH__ placeholders they are substituted as usual; if it is
+#     an unmodified SAP file, edit its modification section yourself. ---
+if [[ -n "${SQL_FILE:-}" ]]; then
+  [[ -r "${SQL_FILE}" ]] || die "SQL_FILE '${SQL_FILE}' does not exist or is not readable"
+  SQL_TEMPLATE_CONTENT="$(cat "${SQL_FILE}")"
+  echo "Using external SQL template: ${SQL_FILE}" >&2
+  if ! grep -q '__BEGIN_TIME__' "${SQL_FILE}"; then
+    echo "NOTE: '${SQL_FILE}' has no __BEGIN_TIME__ placeholder - it will be sent unchanged," >&2
+    echo "      so BEGIN_TIME / END_TIME / STATEMENT_HASH must already be set inside the file." >&2
+  fi
+fi
 
 esc_begin="$(printf '%s' "${begin_time}" | sed -e 's/[&/\]/\\&/g')"
 esc_end="$(printf '%s' "${end_time}" | sed -e 's/[&/\]/\\&/g')"
@@ -3146,310 +3162,108 @@ printf '%s\n' "${SQL_TEMPLATE_CONTENT}" | sed \
   -e "s/__STATEMENT_HASH__/${esc_hash}/" \
   > "${TMP_SQL}" || die "Failed to generate SQL at ${TMP_SQL}"
 
+# --- optional: quote CONSTRAINT, which is a reserved word in newer HANA
+#     revisions but is used as a plain identifier by the SAP collector SQL.
+#     Set SQL_FIXUPS=1 if the server rejects the statement around the
+#     ACCESSED_INDEX_COLUMNS CTE. On by default; set SQL_FIXUPS=0 to send the
+#     SAP text completely unchanged. ---
+if [[ "${SQL_FIXUPS:-1}" == "1" ]]; then
+  sed -i \
+    -e 's/^\([[:space:]]*\)CONSTRAINT\([,]*\)[[:space:]]*$/\1"CONSTRAINT"\2/' \
+    -e 's/\([A-Za-z0-9_]\)\.CONSTRAINT\([^_A-Za-z0-9]\)/\1."CONSTRAINT"\2/g' \
+    -e 's/\([A-Za-z0-9_]\)\.CONSTRAINT$/\1."CONSTRAINT"/' \
+    -e "s/'' CONSTRAINT[[:space:]]*$/'' \"CONSTRAINT\"/" \
+    -e 's/IFNULL(CONSTRAINT,/IFNULL("CONSTRAINT",/g' \
+    "${TMP_SQL}" || die "SQL fixup pass failed"
+  echo "Applied SQL_FIXUPS: reserved word CONSTRAINT quoted in ${TMP_SQL}" >&2
+fi
+
 echo "sid=${db_sid} inst=${db_inst_no} db=${db_name}" >&2
 echo "Generated SQL with BEGIN_TIME='${begin_time}' END_TIME='${end_time}' STATEMENT_HASH='${statement_hash}' -> ${TMP_SQL}" >&2
 
-HDBSQL_ARGS=(-i "${db_inst_no}" -d "${db_name}")
-
+# --- authentication arguments, shared by the version probe and the main run ---
+HDBSQL_AUTH=(-i "${db_inst_no}" -d "${db_name}")
 if [[ "${db_password}" == "none" || "${db_password}" == "NONE" ]]; then
-  HDBUSERSTORE_KEY="${schemaName}"
-  HDBSQL_ARGS+=(-U "${HDBUSERSTORE_KEY}")
+  HDBSQL_AUTH+=(-U "${schemaName}")
 else
-  HDBSQL_ARGS+=(-u "${schemaName}" -p "${db_password}")
+  HDBSQL_AUTH+=(-u "${schemaName}" -p "${db_password}")
 fi
 
-HDBSQL_ARGS+=(-I "${TMP_SQL}" -o "${OUTPUT_FILE}")
+# --- pre-flight: report the revision, warn if the embedded SQL needs a newer one ---
+if [[ "${SKIP_VERSION_CHECK:-0}" != "1" && -z "${SQL_FILE:-}" ]]; then
+  db_version="$("${HDBSQL_BIN}" "${HDBSQL_AUTH[@]}" "SELECT VERSION FROM M_DATABASE" 2>/dev/null \
+                 | grep -Eo '[0-9]+\.[0-9]{2}\.[0-9]{3}[0-9.]*' | head -1)"
+  if [[ -n "${db_version}" ]]; then
+    echo "Database revision: ${db_version}" >&2
+    v_major="${db_version%%.*}"
+    v_rest="${db_version#*.}"
+    v_patch="${v_rest#*.}"; v_patch="${v_patch%%.*}"
+    if [[ "${v_major}" =~ ^[0-9]+$ && "${v_patch}" =~ ^[0-9]+$ ]]; then
+      if (( v_major < 2 || ( v_major == 2 && 10#${v_patch} < 70 ) )); then
+        echo "WARNING: the embedded SQL is the HANA_SQL_StatementHash_DataCollector_2.00.070+ variant," >&2
+        echo "         but this database is ${db_version}. Download the matching variant from SAP Note" >&2
+        echo "         1969700 and pass it with SQL_FILE=/path/to/that/file.sql" >&2
+      fi
+    fi
+  fi
+fi
 
-"${HDBSQL_BIN}" "${HDBSQL_ARGS[@]}" || die "hdbsql execution failed"
+HDBSQL_ARGS=("${HDBSQL_AUTH[@]}" -I "${TMP_SQL}" -o "${OUTPUT_FILE}")
 
+"${HDBSQL_BIN}" "${HDBSQL_ARGS[@]}" > "${ERR_FILE}" 2>&1
+hdbsql_rc=$?
+[[ -s "${ERR_FILE}" ]] && cat "${ERR_FILE}" >&2
+
+if [[ ${hdbsql_rc} -ne 0 ]]; then
+  # If HANA reported a parse position, show that part of the generated SQL so
+  # the offending construct is visible without hunting through 3000 lines.
+  err_line="$(sed -n 's/.*line \([0-9][0-9]*\) col [0-9][0-9]*.*/\1/p' "${ERR_FILE}" | head -1)"
+  if [[ -n "${err_line}" ]]; then
+    echo "" >&2
+    echo "--- ${TMP_SQL} around line ${err_line} ---" >&2
+    awk -v bad="${err_line}" 'NR >= bad-6 && NR <= bad+6 {
+           printf "%s %5d | %s\n", (NR == bad ? ">>" : "  "), NR, $0 }' "${TMP_SQL}" >&2
+  fi
+
+  # --- isolate which SQL construct this server rejects -----------------------
+  if grep -qi "syntax error" "${ERR_FILE}"; then
+    probe() {
+      if "${HDBSQL_BIN}" "${HDBSQL_AUTH[@]}" "$2" >/dev/null 2>&1; then
+        echo "  [ OK   ]  $1" >&2
+      else
+        echo "  [ FAIL ]  $1" >&2
+      fi
+    }
+    echo "" >&2
+    echo "--- probing which construct this database rejects ---" >&2
+    probe "server reachable                    " "SELECT 1 FROM DUMMY"
+    probe "empty window spec  MAX(..) OVER ()  " "SELECT MAX(LENGTH(A)) OVER () L FROM ( SELECT 'x' A FROM DUMMY )"
+    probe "OVER () above a UNION ALL subquery  " "SELECT MAX(LENGTH(A)) OVER () L FROM ( SELECT 'x' A FROM DUMMY UNION ALL SELECT 'y' A FROM DUMMY )"
+    probe "bare reserved word CONSTRAINT       " "SELECT CONSTRAINT FROM INDEX_COLUMNS WHERE 1 = 0"
+    probe "quoted \"CONSTRAINT\"                 " "SELECT \"CONSTRAINT\" FROM INDEX_COLUMNS WHERE 1 = 0"
+    probe "GREATEST(n, MAX(..) OVER ())        " "SELECT GREATEST(10, MAX(LENGTH(A)) OVER ()) L FROM ( SELECT 'x' A FROM DUMMY )"
+    echo "" >&2
+    echo "A FAIL above names the construct to work around. If only the CONSTRAINT probe fails," >&2
+    echo "make sure SQL_FIXUPS is not set to 0. If a window-function probe fails, this revision" >&2
+    echo "needs a different collector variant from SAP Note 1969700 (pass it via SQL_FILE=...)." >&2
+  fi
+  die "hdbsql execution failed (rc=${hdbsql_rc}, log: ${ERR_FILE})"
+fi
+
+rm -f "${ERR_FILE}"
 echo "Output written to ${OUTPUT_FILE}"
 
-# --- Optional: render the raw output as a formatted, multi-section PDF report.
-#     This is a pure post-processing convenience step on top of the hdbsql
-#     output above; it never touches the SQL or the .out file, and if
-#     python3 / the reportlab package aren't available on this host it just
-#     skips itself with a warning instead of failing the script. ---
-PDF_SCRIPT="${script_dir}/hana_report_to_pdf.py"
-PDF_OUTPUT="${OUTPUT_FILE%.out}.pdf"
 
-cat > "${PDF_SCRIPT}" <<'PYEOF'
-#!/usr/bin/env python3
-"""
-hana_report_to_pdf.py
+# ---------------------------------------------------------------------------
+# Rendering (HTML / PDF) is done by the companion script.
+# Run it manually, or set RENDER=1 to have it called automatically.
+# ---------------------------------------------------------------------------
+RENDER_SCRIPT="${RENDER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/hana_report_render.sh}"
 
-Converts the plain-text hdbsql output of HANA_SQL_StatementHash_DataCollector
-(SAP Note 1969700) into a formatted, multi-page landscape PDF report with a
-cover summary, a bookmarked/clickable table of contents, and every report
-section rendered as a proper table.
-
-Usage:
-    python3 hana_report_to_pdf.py <input.out> <output.pdf>
-"""
-import re
-import sys
-
-from reportlab.lib.pagesizes import landscape, A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, PageBreak
-)
-from reportlab.platypus.tableofcontents import TableOfContents
-
-if len(sys.argv) != 3:
-    print("Usage: python3 hana_report_to_pdf.py <input.out> <output.pdf>", file=sys.stderr)
-    sys.exit(1)
-
-SRC, OUT = sys.argv[1], sys.argv[2]
-
-NAVY = colors.HexColor("#1a2f4b")
-ACCENT = colors.HexColor("#2f6fa8")
-LIGHT = colors.HexColor("#eef3f8")
-GREY = colors.HexColor("#5a6773")
-
-# ---------- Load & unescape raw lines ----------
-raw_lines = []
-with open(SRC, "r", encoding="utf-8", errors="replace") as f:
-    for line in f:
-        line = line.rstrip("\n")
-        if line == "LINE":
-            continue
-        content = line[1:-1] if line.startswith('"') and line.endswith('"') else line
-        content = content.replace('\\"', '"')
-        raw_lines.append(content)
-
-# ---------- Split into sections by "****...*" banner blocks ----------
-def is_banner(l):
-    return bool(re.fullmatch(r"\*{5,}", l.strip()))
-
-sections = []
-i, n = 0, len(raw_lines)
-preamble = []
-current_title, current_lines = None, []
-while i < n:
-    l = raw_lines[i]
-    if (is_banner(l) and i + 2 < n and is_banner(raw_lines[i + 2])
-            and raw_lines[i + 1].strip().startswith("*") and raw_lines[i + 1].strip().endswith("*")):
-        if current_title is not None:
-            sections.append((current_title, current_lines))
-        elif current_lines:
-            preamble.extend(current_lines)
-        current_title = raw_lines[i + 1].strip().strip("*").strip()
-        current_lines = []
-        i += 3
-        continue
-    current_lines.append(l)
-    i += 1
-if current_title is not None:
-    sections.append((current_title, current_lines))
-
-if sections and sections[0][0].strip().upper().startswith("SAP HANA STATEMENT HASH DATA COLLECTION"):
-    _, preamble = sections.pop(0)
-
-# ---------- Helpers ----------
-def is_ruler(l):
-    s = l.strip()
-    return len(s) > 0 and set(s.replace(" ", "")) <= {"="} and s.count("=") >= 2
-
-def col_bounds(ruler):
-    return [[m.start(), m.end()] for m in re.finditer(r"=+", ruler)]
-
-def slice_row(line, bounds):
-    cells = []
-    for idx, (s, e) in enumerate(bounds):
-        cell = (line[s:] if idx == len(bounds) - 1 else line[s:e]) if s < len(line) else ""
-        cells.append(cell.strip())
-    return cells
-
-def split_blocks(lines):
-    blocks, cur = [], []
-    for l in lines:
-        if l.strip() == "":
-            if cur:
-                blocks.append(cur)
-                cur = []
-        else:
-            cur.append(l)
-    if cur:
-        blocks.append(cur)
-    return blocks
-
-styles = getSampleStyleSheet()
-title_style = ParagraphStyle("TitleBig", parent=styles["Title"], textColor=NAVY, fontSize=24, spaceAfter=6)
-subtitle_style = ParagraphStyle("Sub", parent=styles["Normal"], textColor=GREY, fontSize=11, spaceAfter=2)
-section_style = ParagraphStyle("Sec", parent=styles["Heading1"], textColor=colors.white, fontSize=13,
-                               backColor=NAVY, borderPadding=(6, 8, 6, 8), spaceBefore=14, spaceAfter=8)
-toc_title_style = ParagraphStyle("TocTitle", parent=styles["Title"], textColor=NAVY, fontSize=18, spaceAfter=12)
-mono_style = ParagraphStyle("Mono", parent=styles["Normal"], fontName="Courier", fontSize=7.5, leading=9.5,
-                             textColor=colors.HexColor("#20242b"))
-cell_style = ParagraphStyle("Cell", parent=styles["Normal"], fontName="Helvetica", fontSize=7.2, leading=8.6,
-                             wordWrap="CJK")
-hdr_cell_style = ParagraphStyle("HdrCell", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.4,
-                                 leading=8.8, textColor=colors.white)
-note_style = ParagraphStyle("Note", parent=styles["Normal"], fontName="Helvetica-Oblique", fontSize=8, textColor=GREY)
-
-def esc(t):
-    return t.replace("&", "&amp;").replace("<", "&lt;") if t else "&nbsp;"
-
-def compute_col_widths(header_cells, data_rows, avail_width, min_cm=1.55, max_cm=9.5, char_w=4.35):
-    ncols = len(header_cells)
-    maxlen = [len(h) for h in header_cells]
-    for row in data_rows:
-        for idx, c in enumerate(row):
-            if idx < ncols:
-                maxlen[idx] = max(maxlen[idx], len(c))
-    raw = [max(min_cm * cm, min(max_cm * cm, m * char_w)) for m in maxlen]
-    scale = avail_width / sum(raw)
-    return [w * scale for w in raw]
-
-def make_table(header_cells, data_rows, avail_width):
-    widths = compute_col_widths(header_cells, data_rows, avail_width)
-    tbl_data = [[Paragraph(esc(h), hdr_cell_style) for h in header_cells]]
-    for row in data_rows:
-        tbl_data.append([Paragraph(esc(c), cell_style) for c in row])
-    t = Table(tbl_data, colWidths=widths, repeatRows=1)
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d0da")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return t
-
-def render_generic_section(lines, avail_width):
-    flows = []
-    blocks = split_blocks(lines)
-    if not blocks:
-        return [Paragraph("<i>No data returned for this section.</i>", note_style)]
-    for block in blocks:
-        if len(block) >= 2 and is_ruler(block[1]):
-            bounds = col_bounds(block[1])
-            header_cells = slice_row(block[0], bounds)
-            data_rows = [slice_row(l, bounds) for l in block[2:]]
-            flows.append(make_table(header_cells, data_rows, avail_width))
-        else:
-            text = "<br/>".join(l.replace("&", "&amp;").replace("<", "&lt;").replace("\\n", "<br/>") for l in block)
-            flows.append(Paragraph(text, mono_style))
-        flows.append(Spacer(1, 8))
-    return flows
-
-def render_key_figures(lines, avail_width):
-    """KEY FIGURES is one logical table whose rows are split across several
-    blank-line-separated groups in the raw output; merge them back into a
-    single continuous table instead of one table per group."""
-    blocks = split_blocks(lines)
-    if not blocks:
-        return [Paragraph("<i>No data returned for this section.</i>", note_style)]
-    header_block = blocks[0]
-    bounds = col_bounds(header_block[1])
-    header_cells = slice_row(header_block[0], bounds)
-    data_rows = [slice_row(l, bounds) for l in header_block[2:]]
-    for block in blocks[1:]:
-        for l in block:
-            data_rows.append(slice_row(l, bounds))
-    return [make_table(header_cells, data_rows, avail_width), Spacer(1, 8)]
-
-# ---------- Document with TOC + outline bookmarks ----------
-class ReportDoc(SimpleDocTemplate):
-    def afterFlowable(self, flowable):
-        if isinstance(flowable, Paragraph) and flowable.style.name == "Sec":
-            text = flowable.getPlainText()
-            key = "sec-%d" % id(flowable) if not hasattr(flowable, "_bmkey") else flowable._bmkey
-            self.canv.bookmarkPage(key)
-            self.canv.addOutlineEntry(text, key, level=0, closed=False)
-            self.notify("TOCEntry", (0, text, self.page, key))
-
-doc = ReportDoc(
-    OUT, pagesize=landscape(A4),
-    leftMargin=1.4 * cm, rightMargin=1.4 * cm, topMargin=1.3 * cm, bottomMargin=1.3 * cm,
-    title="SAP HANA Statement Hash Analysis Report",
-)
-avail_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
-
-meta = {}
-for l in preamble:
-    if ":" in l and not l.strip().startswith("*"):
-        parts = re.split(r":\s+", l, maxsplit=1)
-        if len(parts) == 2:
-            meta[parts[0].strip()] = parts[1].strip()
-
-story = []
-
-# ----- Cover -----
-story.append(Paragraph("SAP HANA Statement Hash Analysis Report", title_style))
-story.append(Paragraph("Deep-dive diagnostic collected via HANA_SQL_StatementHash_DataCollector (SAP Note 1969700)",
-                        subtitle_style))
-story.append(Spacer(1, 10))
-story.append(HRFlowable(width="100%", thickness=1.4, color=ACCENT))
-story.append(Spacer(1, 10))
-
-info_rows = [
-    ["Statement Hash", meta.get("Statement hash", "")],
-    ["System / Database", meta.get("System ID / database name", "")],
-    ["Revision Level", meta.get("Revision level", "")],
-    ["Analysis Window", f'{meta.get("Start time", "")}  →  {meta.get("End time", "")}'],
-    ["Report Source", meta.get("Generated with", "")],
-]
-info_tbl = Table(
-    [[Paragraph(f"<b>{k}</b>", cell_style), Paragraph(esc(v), cell_style)] for k, v in info_rows],
-    colWidths=[5.5 * cm, avail_w - 5.5 * cm],
-)
-info_tbl.setStyle(TableStyle([
-    ("BACKGROUND", (0, 0), (0, -1), LIGHT),
-    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d0da")),
-    ("TOPPADDING", (0, 0), (-1, -1), 5),
-    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-]))
-story.append(info_tbl)
-story.append(Spacer(1, 18))
-
-# ----- Table of contents -----
-story.append(Paragraph("Contents", toc_title_style))
-toc = TableOfContents()
-toc.levelStyles = [
-    ParagraphStyle(name="TOCLevel0", fontName="Helvetica", fontSize=10.5, leading=16,
-                    textColor=colors.HexColor("#1a2f4b")),
-]
-story.append(toc)
-story.append(PageBreak())
-
-# ----- Sections -----
-for title, lines in sections:
-    story.append(Paragraph(title, section_style))
-    if title.strip().upper() == "KEY FIGURES":
-        story.extend(render_key_figures(lines, avail_w))
-    else:
-        story.extend(render_generic_section(lines, avail_w))
-
-def add_page_furniture(canvas, doc_):
-    canvas.saveState()
-    canvas.setStrokeColor(ACCENT)
-    canvas.setLineWidth(1)
-    canvas.line(doc_.leftMargin, 1.0 * cm, landscape(A4)[0] - doc_.rightMargin, 1.0 * cm)
-    canvas.setFont("Helvetica", 8)
-    canvas.setFillColor(GREY)
-    canvas.drawString(doc_.leftMargin, 0.65 * cm,
-                       "SAP HANA Statement Hash Analysis  |  Statement Hash: " + meta.get("Statement hash", ""))
-    canvas.drawRightString(landscape(A4)[0] - doc_.rightMargin, 0.65 * cm, f"Page {doc_.page}")
-    canvas.restoreState()
-
-doc.multiBuild(story, onFirstPage=add_page_furniture, onLaterPages=add_page_furniture)
-print("Wrote", OUT)
-PYEOF
-
-if command -v python3 >/dev/null 2>&1 && python3 -c 'import reportlab' >/dev/null 2>&1; then
-  if python3 "${PDF_SCRIPT}" "${OUTPUT_FILE}" "${PDF_OUTPUT}"; then
-    echo "PDF report written to ${PDF_OUTPUT}"
-  else
-    echo "WARNING: PDF report generation failed; the raw output at ${OUTPUT_FILE} is still valid and unaffected." >&2
-  fi
+if [[ "${RENDER:-0}" == "1" && -x "${RENDER_SCRIPT}" ]]; then
+  "${RENDER_SCRIPT}" "${OUTPUT_FILE}" "${db_sid}" "${db_inst_no}" "${statement_hash}"
 else
-  echo "NOTE: python3 with the 'reportlab' package is not available on this host, so the PDF report was skipped. The raw output at ${OUTPUT_FILE} is unaffected. (Install with: pip3 install reportlab)" >&2
+  echo ""
+  echo "To create the HTML / PDF reports, run:"
+  echo "  ${RENDER_SCRIPT} ${OUTPUT_FILE} ${db_sid} ${db_inst_no} ${statement_hash}"
 fi
