@@ -1620,6 +1620,21 @@ thread3="$(sed -n '3p' <<< "${top_hashes}")"
 
 echo
 echo "Top STATEMENT_HASH values: thread1='${thread1}' thread2='${thread2}' thread3='${thread3}'"
-[[ -n "${thread1}" ]] && echo "##gbStart##thread1##splitKeyValue##${thread1}##gbEnd##"
-[[ -n "${thread2}" ]] && echo "##gbStart##thread2##splitKeyValue##${thread2}##gbEnd##"
-[[ -n "${thread3}" ]] && echo "##gbStart##thread3##splitKeyValue##${thread3}##gbEnd##"
+
+## One marker per line, each guarded so an absent hash is simply not published.
+## Using if/fi rather than "[[ ... ]] && echo" also keeps the exit status at 0
+## when a hash is missing - a bare && on the final line would leave the script
+## exiting 1 and the calling step would read that as a failure.
+if [[ -n "${thread1}" ]]; then
+  echo "##gbStart##thread1##splitKeyValue##${thread1}##gbEnd##"
+fi
+
+if [[ -n "${thread2}" ]]; then
+  echo "##gbStart##thread2##splitKeyValue##${thread2}##gbEnd##"
+fi
+
+if [[ -n "${thread3}" ]]; then
+  echo "##gbStart##thread3##splitKeyValue##${thread3}##gbEnd##"
+fi
+
+exit 0
