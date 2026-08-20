@@ -21,6 +21,21 @@ else
         exit 1
 fi
 
+## The orchestrating platform passes timestamps as a single whitespace-free
+## token (e.g. 2026/08/19_00:26:20) so the value survives unquoted expansion on
+## the command line. Turn the separator back into a space before it reaches the
+## SQL. Shortcut forms (C, C-H2, E-S900, MIN, MAX, ...) contain no underscore and
+## are passed through untouched.
+normalize_time() {
+  if [[ "${1}" =~ ^([0-9]{4}/[0-9]{2}/[0-9]{2})_([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    printf '%s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s' "${1}"
+  fi
+}
+begin_time="$(normalize_time "${begin_time}")"
+end_time="$(normalize_time "${end_time}")"
+
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_sid}"
 
