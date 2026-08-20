@@ -520,6 +520,6 @@ else
   echo "Peak window half-width        : ${window_label} (${peak_window_min} min)"
   echo "BEGIN_TIME (peak - ${window_label})$(printf '%*s' $((10 - ${#window_label})) ''): ${new_begin_time}"
   echo "END_TIME   (peak + ${window_label})$(printf '%*s' $((10 - ${#window_label})) ''): ${new_end_time}"
-  echo "##gbStart##peakcpustartTime##splitKeyValue##${new_begin_time}##gbEnd##"
-  echo "##gbStart##peakcpuendTime##splitKeyValue##${new_end_time}##gbEnd##"
+  echo "##gbStart##peakcpustartTime##splitKeyValue##'${new_begin_time}'##gbEnd##"
+  echo "##gbStart##peakcpuendTime##splitKeyValue##'${new_end_time}'##gbEnd##"
 fi
