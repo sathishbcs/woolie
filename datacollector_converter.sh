@@ -4326,3 +4326,21 @@ if [[ "${REPORT_FORMAT}" == "pdf" || "${REPORT_FORMAT}" == "both" ]]; then
     fi
   fi
 fi
+
+# --- 4) Publish the rendered report locations as platform variables ---
+# Tested with -s (exists and is non-empty) rather than off REPORT_FORMAT or the
+# engine loop, so a format that was requested but failed to render leaves its
+# variable unpublished instead of pointing at a missing or truncated file.
+echo
+
+if [[ -s "${HTML_OUTPUT}" ]]; then
+  echo "HTML report path : ${HTML_OUTPUT}"
+  echo "##gbStart##htmlReportPath##splitKeyValue##${HTML_OUTPUT}##gbEnd##"
+fi
+
+if [[ -s "${PDF_OUTPUT}" ]]; then
+  echo "PDF report path  : ${PDF_OUTPUT}"
+  echo "##gbStart##pdfReportPath##splitKeyValue##${PDF_OUTPUT}##gbEnd##"
+fi
+
+exit 0
