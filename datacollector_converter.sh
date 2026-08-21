@@ -22,21 +22,6 @@ else
         exit 1
 fi
 
-## Symphony passes timestamps as a single whitespace-free token
-## (e.g. 2026/08/19_00:26:20) so the value survives unquoted expansion on the
-## command line. Turn the separator back into a space before it reaches the SQL,
-## which expects 'YYYY/MM/DD HH24:MI:SS'. Values already in the spaced form are
-## returned unchanged, as are the shortcut forms (C, C-H2, E-S900, MIN, MAX).
-normalize_time() {
-  if [[ "${1}" =~ ^([0-9]{4}/[0-9]{2}/[0-9]{2})_([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
-    printf '%s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-  else
-    printf '%s' "${1}"
-  fi
-}
-begin_time="$(normalize_time "${begin_time}")"
-end_time="$(normalize_time "${end_time}")"
-
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_sid}"    ## tenant/system database name for -d, assumed same as SID
 
@@ -4327,19 +4312,60 @@ if [[ "${REPORT_FORMAT}" == "pdf" || "${REPORT_FORMAT}" == "both" ]]; then
   fi
 fi
 
-# --- Publish the rendered report locations as Symphony variables ---
-# Guarded with -s (exists and is non-empty) rather than on REPORT_FORMAT or the
-# engine loop, so a format that was requested but failed to render leaves its
-# variable unpublished instead of pointing at a missing or truncated file.
+# ===========================================================================
+# Publish rendered report locations as Symphony global variables.
+#
+# Key scheme (every key starts with a letter; hash/SID normalised to [A-Za-z0-9_]):
+#   HSH_<SID>_<HASH>_<RUNID>_<kind>  unique per run  -> history, never overwritten
+#   HSH_<SID>_<HASH>_<kind>          latest run for THIS statement hash
+#   HSH_LAST_<kind>                  latest run, any hash -> stable name for
+#                                    downstream steps (mail, attach, ticket)
+#
+# Guarded with -s (file exists and is non-empty) rather than on REPORT_FORMAT,
+# so a format that was requested but failed to render leaves its variable
+# unpublished instead of pointing at a missing or truncated file.
+# ===========================================================================
+
+gb_put() {   # gb_put <key> <value>
+  printf '##gbStart##%s##splitKeyValue##%s##splitKeyValue##string##gbEnd##\n' "$1" "$2"
+}
+
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
+
+hash_key="$(sanitize "${statement_hash}")"
+sid_key="$(sanitize "${db_sid}")"
+run_id="${ts}"                          # YYYYMMDD_HHMMSS, set before the SQL run
+prefix="HSH_${sid_key}_${hash_key}"
+
+publish() {  # publish <kind> <path>
+  local kind="$1" path="$2"
+  [[ -s "${path}" ]] || return 0
+  printf '%-16s : %s\n' "${kind}" "${path}"
+  gb_put "${prefix}_${run_id}_${kind}" "${path}"   # unique  - kept forever
+  gb_put "${prefix}_${kind}"           "${path}"   # latest for this hash
+  gb_put "HSH_LAST_${kind}"            "${path}"   # common  - always current run
+}
+
 echo
+publish htmlReportPath "${HTML_OUTPUT}"
+publish pdfReportPath  "${PDF_OUTPUT}"
+publish txtReportPath  "${CLEAN_TXT}"
+publish rawOutputPath  "${OUTPUT_FILE}"
 
-if [[ -s "${HTML_OUTPUT}" ]]; then
-  echo "HTML report path : ${HTML_OUTPUT}"
-  echo "##gbStart##${statement_hash}_htmlReportPath##splitKeyValue##${HTML_OUTPUT}##splitKeyValue##string##gbEnd##"
-fi
+gb_put "HSH_LAST_statementHash" "${statement_hash}"
+gb_put "HSH_LAST_sid"           "${db_sid}"
+gb_put "HSH_LAST_runId"         "${run_id}"
+gb_put "${prefix}_runId"        "${run_id}"
 
-if [[ -s "${PDF_OUTPUT}" ]]; then
-  echo "PDF report path  : ${PDF_OUTPUT}"
-  echo "##gbStart##${statement_hash}_pdfReportPath##splitKeyValue##${PDF_OUTPUT}##splitKeyValue##string##gbEnd##"
+# --- append-only run history (global variables cannot be appended to) --------
+INDEX_FILE="${script_dir}/report_index.csv"
+if [[ ! -f "${INDEX_FILE}" ]]; then
+  echo "run_id,sid,db,statement_hash,begin_time,end_time,raw,txt,html,pdf" > "${INDEX_FILE}"
 fi
+printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  "${run_id}" "${db_sid}" "${db_name}" "${statement_hash}" \
+  "${begin_time}" "${end_time}" \
+  "${OUTPUT_FILE}" "${CLEAN_TXT}" "${HTML_OUTPUT}" "${PDF_OUTPUT}" >> "${INDEX_FILE}"
+gb_put "HSH_reportIndexPath" "${INDEX_FILE}"
+
 exit 0
