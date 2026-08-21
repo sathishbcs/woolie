@@ -4335,12 +4335,11 @@ echo
 
 if [[ -s "${HTML_OUTPUT}" ]]; then
   echo "HTML report path : ${HTML_OUTPUT}"
-  echo "##gbStart##htmlReportPath##splitKeyValue##${HTML_OUTPUT}##string##gbEnd##"
+  echo "##gbStart##${statement_hash}_htmlReportPath##splitKeyValue##${HTML_OUTPUT}##string##gbEnd##"
 fi
 
 if [[ -s "${PDF_OUTPUT}" ]]; then
   echo "PDF report path  : ${PDF_OUTPUT}"
-  echo "##gbStart##pdfReportPath##splitKeyValue##${PDF_OUTPUT}##string##gbEnd##"
+  echo "##gbStart##${statement_hash}_pdfReportPath##splitKeyValue##${PDF_OUTPUT}##string##gbEnd##"
 fi
-
 exit 0
