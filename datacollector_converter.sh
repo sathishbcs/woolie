@@ -22,6 +22,21 @@ else
         exit 1
 fi
 
+## Symphony passes timestamps as a single whitespace-free token
+## (e.g. 2026/08/19_00:26:20) so the value survives unquoted expansion on the
+## command line. Turn the separator back into a space before it reaches the SQL,
+## which expects 'YYYY/MM/DD HH24:MI:SS'. Values already in the spaced form are
+## returned unchanged, as are the shortcut forms (C, C-H2, E-S900, MIN, MAX).
+normalize_time() {
+  if [[ "${1}" =~ ^([0-9]{4}/[0-9]{2}/[0-9]{2})_([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    printf '%s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s' "${1}"
+  fi
+}
+begin_time="$(normalize_time "${begin_time}")"
+end_time="$(normalize_time "${end_time}")"
+
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_sid}"    ## tenant/system database name for -d, assumed same as SID
 
@@ -3253,17 +3268,1079 @@ fi
 rm -f "${ERR_FILE}"
 echo "Output written to ${OUTPUT_FILE}"
 
+# ===========================================================================
+# Post-processing: render the raw hdbsql output as a readable report.
+#
+#   REPORT_FORMAT : html | pdf | both (default) | none
+#   PDF_ENGINE    : auto (default) | reportlab | wkhtmltopdf | chrome |
+#                   weasyprint | libreoffice | awk | none
+#
+# Nothing below can affect the SQL or the .out file. Every step is optional,
+# failures are warnings only, and the awk-based HTML/PDF renderers need no
+# python, no reportlab and no other package at all.
+# ===========================================================================
+REPORT_FORMAT="${REPORT_FORMAT:-both}"
+PDF_ENGINE="${PDF_ENGINE:-auto}"
+AWK_BIN="${AWK_BIN:-awk}"
 
-# ---------------------------------------------------------------------------
-# Rendering (HTML / PDF) is done by the companion script.
-# Run it manually, or set RENDER=1 to have it called automatically.
-# ---------------------------------------------------------------------------
-RENDER_SCRIPT="${RENDER_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/hana_report_render.sh}"
+BASE="${OUTPUT_FILE%.out}"
+CLEAN_TXT="${BASE}.txt"
+HTML_OUTPUT="${BASE}.html"
+PDF_OUTPUT="${BASE}.pdf"
+PDF_SCRIPT="${script_dir}/hana_report_to_pdf.py"
+AWK_CLEAN="${script_dir}/hana_report_clean.awk"
+AWK_HTML="${script_dir}/hana_report_to_html.awk"
+AWK_PDF="${script_dir}/hana_report_to_pdf.awk"
+FOOTER_TEXT="SAP HANA Statement Hash Analysis  |  ${db_sid} / ${db_name}  |  hash ${statement_hash}"
 
-if [[ "${RENDER:-0}" == "1" && -x "${RENDER_SCRIPT}" ]]; then
-  "${RENDER_SCRIPT}" "${OUTPUT_FILE}" "${db_sid}" "${db_inst_no}" "${statement_hash}"
-else
-  echo ""
-  echo "To create the HTML / PDF reports, run:"
-  echo "  ${RENDER_SCRIPT} ${OUTPUT_FILE} ${db_sid} ${db_inst_no} ${statement_hash}"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- awk renderer 1/3: unquote the hdbsql -o output into plain report text ---
+cat > "${AWK_CLEAN}" <<'AWKCLEANEOF'
+{
+  line = $0
+  sub(/\r$/, "", line)
+  if (line == "LINE") next
+  if (line ~ /^".*"$/ && length(line) >= 2)
+    line = substr(line, 2, length(line) - 2)
+  gsub(/\\"/, "\"", line)
+  print line
+}
+AWKCLEANEOF
+
+# --- awk renderer 2/3: fixed-width report text -> self-contained HTML ---
+cat > "${AWK_HTML}" <<'AWKHTMLEOF'
+# ---------------------------------------------------------------------------
+# hana_report_to_html.awk
+# Renders the plain-text output of HANA_SQL_StatementHash_DataCollector
+# (SAP Note 1969700) as a self-contained HTML report.
+# Requires nothing but awk (mawk/gawk/nawk). Input = cleaned report text.
+# Vars: -v RSID= -v RHASH= -v RGEN=
+# ---------------------------------------------------------------------------
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+
+function is_banner(s,   t) { t = trim(s); return (t ~ /^\*\*\*\*\*+$/) }
+
+function is_startitle(s,   t) {
+  t = trim(s)
+  return (length(t) >= 2 && substr(t, 1, 1) == "*" && substr(t, length(t), 1) == "*")
+}
+
+function is_ruler(s,   t) {
+  t = trim(s)
+  if (t == "") return 0
+  gsub(/ /, "", t)
+  if (t !~ /^=+$/) return 0
+  return (length(t) >= 2)
+}
+
+function strip_stars(s,   t) {
+  t = trim(s)
+  sub(/^\*+/, "", t); sub(/\*+$/, "", t)
+  return trim(t)
+}
+
+function esc(s) {
+  gsub(/&/, "\\&amp;", s)
+  gsub(/</, "\\&lt;", s)
+  gsub(/>/, "\\&gt;", s)
+  return s
+}
+
+# fill BS[]/BE[] (1-based, inclusive) from an "=== === ===" ruler line
+function col_bounds(ruler,   i, ch, inrun) {
+  NB = 0; inrun = 0
+  for (i = 1; i <= length(ruler); i++) {
+    ch = substr(ruler, i, 1)
+    if (ch == "=") {
+      if (!inrun) { NB++; BS[NB] = i; inrun = 1 }
+      BE[NB] = i
+    } else inrun = 0
+  }
+  return NB
+}
+
+function cell(line, idx) {
+  if (idx == NB) return trim(substr(line, BS[idx]))
+  return trim(substr(line, BS[idx], BE[idx] - BS[idx] + 1))
+}
+
+function slug(s,   t) {
+  t = tolower(trim(s))
+  gsub(/[^a-z0-9]+/, "-", t)
+  sub(/^-+/, "", t); sub(/-+$/, "", t)
+  return t
+}
+
+{ line = $0; sub(/\r$/, "", line); L[++N] = line }
+
+END {
+  # ---------- split into preamble + sections ----------
+  i = 1; nsec = 0; ncur = 0; npre = 0; havetitle = 0
+  while (i <= N) {
+    if (is_banner(L[i]) && (i + 2) <= N && is_banner(L[i+2]) && is_startitle(L[i+1])) {
+      if (havetitle) {
+        nsec++; STITLE[nsec] = curtitle; SN[nsec] = ncur
+        for (k = 1; k <= ncur; k++) SL[nsec, k] = CUR[k]
+      } else {
+        for (k = 1; k <= ncur; k++) PRE[++npre] = CUR[k]
+      }
+      curtitle = strip_stars(L[i+1]); havetitle = 1; ncur = 0
+      i += 3
+      continue
+    }
+    CUR[++ncur] = L[i]; i++
+  }
+  if (havetitle) {
+    nsec++; STITLE[nsec] = curtitle; SN[nsec] = ncur
+    for (k = 1; k <= ncur; k++) SL[nsec, k] = CUR[k]
+  }
+
+  # first section is the document header -> treat as preamble
+  if (nsec >= 1 && toupper(STITLE[1]) ~ /^SAP HANA STATEMENT HASH DATA COLLECTION/) {
+    npre = 0
+    for (k = 1; k <= SN[1]; k++) PRE[++npre] = SL[1, k]
+    for (s = 1; s < nsec; s++) {
+      STITLE[s] = STITLE[s+1]; SN[s] = SN[s+1]
+      for (k = 1; k <= SN[s+1]; k++) SL[s, k] = SL[s+1, k]
+    }
+    nsec--
+  }
+
+  # ---------- metadata from preamble ----------
+  for (k = 1; k <= npre; k++) {
+    p = index(PRE[k], ":")
+    if (p > 1 && substr(trim(PRE[k]), 1, 1) != "*") {
+      key = trim(substr(PRE[k], 1, p - 1))
+      val = trim(substr(PRE[k], p + 1))
+      if (key != "" && val != "" && !(key in META)) META[key] = val
+    }
+  }
+  hash  = (META["Statement hash"] != "" ? META["Statement hash"] : RHASH)
+  sysid = (META["System ID / database name"] != "" ? META["System ID / database name"] : RSID)
+
+  # ---------- HTML head ----------
+  print "<!DOCTYPE html>"
+  print "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+  print "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+  print "<title>SAP HANA Statement Hash Analysis - " esc(hash) "</title>"
+  print "<style>"
+  print ":root{--navy:#1a2f4b;--accent:#2f6fa8;--light:#eef3f8;--grey:#5a6773;--line:#c7d0da}"
+  print "*{box-sizing:border-box}"
+  print "body{margin:0;background:#f4f6f9;color:#20242b;font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}"
+  print ".bar{position:sticky;top:0;z-index:50;background:var(--navy);color:#fff;padding:10px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;box-shadow:0 1px 6px rgba(0,0,0,.25)}"
+  print ".bar b{font-size:15px;letter-spacing:.3px}"
+  print ".bar .sp{flex:1}"
+  print ".bar input{padding:6px 10px;border:0;border-radius:4px;min-width:230px;font-size:13px}"
+  print ".bar button{padding:6px 14px;border:0;border-radius:4px;background:var(--accent);color:#fff;font-size:13px;cursor:pointer}"
+  print ".bar button:hover{background:#3d84c4}"
+  print ".wrap{max-width:1900px;margin:0 auto;padding:18px}"
+  print ".cover{background:#fff;border:1px solid var(--line);border-radius:6px;padding:22px 24px;margin-bottom:18px}"
+  print ".cover h1{margin:0 0 4px;color:var(--navy);font-size:26px}"
+  print ".cover p.sub{margin:0 0 16px;color:var(--grey);font-size:13px}"
+  print ".meta{width:100%;border-collapse:collapse}"
+  print ".meta td{border:1px solid var(--line);padding:7px 10px;font-size:13px;vertical-align:top}"
+  print ".meta td:first-child{background:var(--light);font-weight:600;width:230px;color:var(--navy)}"
+  print ".toc{background:#fff;border:1px solid var(--line);border-radius:6px;padding:18px 24px;margin-bottom:18px}"
+  print ".toc h2{margin:0 0 12px;color:var(--navy);font-size:18px}"
+  print ".toc ol{margin:0;padding-left:20px;columns:3;column-gap:34px;font-size:13px}"
+  print ".toc li{margin:3px 0;break-inside:avoid}"
+  print ".toc a{color:var(--accent);text-decoration:none}.toc a:hover{text-decoration:underline}"
+  print "section{background:#fff;border:1px solid var(--line);border-radius:6px;margin-bottom:16px;overflow:hidden}"
+  print "section>h2{margin:0;background:var(--navy);color:#fff;font-size:14px;letter-spacing:.4px;padding:9px 14px;display:flex;align-items:center}"
+  print "section>h2 a{margin-left:auto;color:#b9d3ec;font-size:11px;text-decoration:none;font-weight:400}"
+  print ".body{padding:12px 14px;overflow-x:auto}"
+  print "table.d{border-collapse:collapse;font-size:12px;margin-bottom:10px;width:auto;min-width:60%}"
+  print "table.d thead th{background:var(--navy);color:#fff;text-align:left;padding:5px 8px;border:1px solid #2c4767;white-space:nowrap;position:static}"
+  print "table.d thead{background:var(--navy)}"
+  print "table.d td{border:1px solid var(--line);padding:4px 8px;vertical-align:top;font-family:Menlo,Consolas,monospace;font-size:11.5px;white-space:pre-wrap}"
+  print "table.d tbody tr:nth-child(even){background:var(--light)}"
+  print "table.d tbody tr:hover{background:#dfeaf5}"
+  print "pre{margin:0 0 10px;font:11.5px/1.4 Menlo,Consolas,monospace;background:#fbfcfd;border:1px solid var(--line);border-left:3px solid var(--accent);padding:9px 11px;white-space:pre-wrap;word-break:break-word}"
+  print ".none{color:var(--grey);font-style:italic;font-size:12.5px}"
+  print ".hide{display:none}"
+  print "footer{color:var(--grey);font-size:11.5px;text-align:center;padding:14px 0 26px}"
+  print "@media print{"
+  print " @page{size:A4 landscape;margin:9mm}"
+  print " body{background:#fff}.bar{display:none}.wrap{max-width:none;padding:0}"
+  print " section{break-inside:auto;page-break-inside:auto;border:0;margin-bottom:10px}"
+  print " section>h2{background:var(--navy)!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}"
+  print " table.d thead th{-webkit-print-color-adjust:exact;print-color-adjust:exact}"
+  print " table.d thead{display:table-header-group}"
+  print " table.d tr{break-inside:avoid;page-break-inside:avoid}"
+  print " .toc{page-break-after:always}"
+  print "}"
+  print "</style></head><body>"
+
+  print "<div class=\"bar\"><b>HANA Statement Hash Analysis</b><span style=\"font:12px Menlo,Consolas,monospace;opacity:.85\">" esc(hash) "</span>"
+  print "<span class=\"sp\"></span>"
+  print "<input id=\"f\" type=\"search\" placeholder=\"Filter rows (type to search)\" oninput=\"flt(this.value)\">"
+  print "<button onclick=\"window.print()\">Print / Save as PDF</button></div>"
+
+  print "<div class=\"wrap\">"
+
+  # ---------- cover ----------
+  print "<div class=\"cover\">"
+  print "<h1>SAP HANA Statement Hash Analysis</h1>"
+  print "<p class=\"sub\">Deep-dive diagnostic collected via HANA_SQL_StatementHash_DataCollector (SAP Note 1969700)</p>"
+  print "<table class=\"meta\">"
+  print "<tr><td>Statement Hash</td><td>" esc(hash) "</td></tr>"
+  print "<tr><td>System / Database</td><td>" esc(sysid) "</td></tr>"
+  print "<tr><td>Revision Level</td><td>" esc(META["Revision level"]) "</td></tr>"
+  print "<tr><td>Analysis Window</td><td>" esc(META["Start time"]) " &rarr; " esc(META["End time"]) "</td></tr>"
+  print "<tr><td>Analysis Time</td><td>" esc(META["Analysis time"]) "</td></tr>"
+  print "<tr><td>Report Source</td><td>" esc(META["Generated with"]) "</td></tr>"
+  if (RGEN != "") print "<tr><td>Collected On Host</td><td>" esc(RGEN) "</td></tr>"
+  print "</table></div>"
+
+  # ---------- toc ----------
+  print "<div class=\"toc\"><h2>Contents</h2><ol>"
+  for (s = 1; s <= nsec; s++)
+    print "<li><a href=\"#s" s "\">" esc(STITLE[s]) "</a></li>"
+  print "</ol></div>"
+
+  # ---------- sections ----------
+  for (s = 1; s <= nsec; s++) {
+    print "<section id=\"s" s "\"><h2>" esc(STITLE[s]) "<a href=\"#\">top &uarr;</a></h2><div class=\"body\">"
+    if (toupper(trim(STITLE[s])) == "KEY FIGURES") render_key_figures(s)
+    else render_section(s)
+    print "</div></section>"
+  }
+
+  print "</div>"
+  print "<footer>Generated by hana_report_to_html.awk &middot; source: " esc(FILENAME) "</footer>"
+  print "<script>"
+  print "function flt(q){q=q.toLowerCase();document.querySelectorAll('section').forEach(function(sec){var any=!q;"
+  print "sec.querySelectorAll('tbody tr').forEach(function(tr){var m=!q||tr.textContent.toLowerCase().indexOf(q)>-1;tr.classList.toggle('hide',!m);if(m)any=true;});"
+  print "sec.querySelectorAll('pre').forEach(function(p){var m=!q||p.textContent.toLowerCase().indexOf(q)>-1;p.classList.toggle('hide',!m);if(m)any=true;});"
+  print "sec.classList.toggle('hide',!any);});}"
+  print "</script></body></html>"
+}
+
+# render one section: blank-line separated blocks, ruler => table, else <pre>
+function render_section(s,   k, nb, blk, j, out, empty) {
+  nb = 0; empty = 1
+  for (k = 1; k <= SN[s]; k++) {
+    if (trim(SL[s, k]) == "") {
+      if (nb > 0) { flush_block(nb); empty = 0; nb = 0 }
+    } else BLK[++nb] = SL[s, k]
+  }
+  if (nb > 0) { flush_block(nb); empty = 0 }
+  if (empty) print "<p class=\"none\">No data returned for this section.</p>"
+}
+
+function flush_block(nb,   j, c, txt) {
+  if (nb >= 2 && is_ruler(BLK[2])) {
+    col_bounds(BLK[2])
+    printf "%s", "<table class=\"d\"><thead><tr>"
+    for (c = 1; c <= NB; c++) printf "<th>%s</th>", esc(cell(BLK[1], c))
+    print "</tr></thead><tbody>"
+    for (j = 3; j <= nb; j++) {
+      printf "%s", "<tr>"
+      for (c = 1; c <= NB; c++) printf "<td>%s</td>", esc(cell(BLK[j], c))
+      print "</tr>"
+    }
+    print "</tbody></table>"
+  } else {
+    txt = ""
+    for (j = 1; j <= nb; j++) txt = txt (j > 1 ? "\n" : "") BLK[j]
+    print "<pre>" esc(txt) "</pre>"
+  }
+}
+
+# KEY FIGURES is one logical table split over several blank-line groups
+function render_key_figures(s,   k, nb, j, c, started, rows, nrows) {
+  nb = 0; nrows = 0; started = 0
+  for (k = 1; k <= SN[s]; k++) {
+    if (trim(SL[s, k]) == "") continue
+    nb++
+    if (nb == 1) { HDR = SL[s, k]; continue }
+    if (nb == 2 && is_ruler(SL[s, k])) { col_bounds(SL[s, k]); started = 1; continue }
+    ROWS[++nrows] = SL[s, k]
+  }
+  if (!started) { render_section(s); return }
+  printf "%s", "<table class=\"d\"><thead><tr>"
+  for (c = 1; c <= NB; c++) printf "<th>%s</th>", esc(cell(HDR, c))
+  print "</tr></thead><tbody>"
+  for (j = 1; j <= nrows; j++) {
+    printf "%s", "<tr>"
+    for (c = 1; c <= NB; c++) printf "<td>%s</td>", esc(cell(ROWS[j], c))
+    print "</tr>"
+  }
+  print "</tbody></table>"
+}
+AWKHTMLEOF
+
+# --- awk renderer 3/3: report text -> formatted landscape A4 PDF (zero dependencies) ---
+cat > "${AWK_PDF}" <<'AWKPDFEOF'
+# ---------------------------------------------------------------------------
+# hana_report_to_pdf.awk
+# Renders the cleaned HANA_SQL_StatementHash_DataCollector text as a formatted
+# landscape-A4 PDF: cover page, real bordered tables with repeating headers and
+# zebra rows, section banners, bookmark outline, page furniture.
+# Pure awk - no python, no reportlab, no ghostscript.
+# Usage: LC_ALL=C awk -v FOOT="..." -f hana_report_to_pdf.awk report.txt > report.pdf
+# ---------------------------------------------------------------------------
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function is_banner(s,   t) { t = trim(s); return (t ~ /^\*\*\*\*\*+$/) }
+function is_startitle(s,   t) {
+  t = trim(s)
+  return (length(t) >= 2 && substr(t, 1, 1) == "*" && substr(t, length(t), 1) == "*")
+}
+function is_ruler(s,   t) {
+  t = trim(s)
+  if (t == "") return 0
+  gsub(/ /, "", t)
+  if (t !~ /^=+$/) return 0
+  return (length(t) >= 2)
+}
+function strip_stars(s,   t) { t = trim(s); sub(/^\*+/, "", t); sub(/\*+$/, "", t); return trim(t) }
+function pesc(s) { gsub(/\\/, "\\\\", s); gsub(/\(/, "\\(", s); gsub(/\)/, "\\)", s); return s }
+function o(s) { printf "%s\n", s; OFF += length(s) + 1 }
+
+# ---------- page / drawing primitives ----------
+function newpage() { NP++; C[NP] = ""; Y = H - MT }
+function emit(s)   { C[NP] = C[NP] s "\n" }
+function rect(x, y, w, h, r, g, b) {
+  emit(sprintf("%.3f %.3f %.3f rg %.2f %.2f %.2f %.2f re f", r, g, b, x, y, w, h))
+}
+function vline(x, y1, y2, lw, r, g, b) {
+  emit(sprintf("%.3f %.3f %.3f RG %.2f w %.2f %.2f m %.2f %.2f l S", r, g, b, lw, x, y1, x, y2))
+}
+function hline(x1, x2, y, lw, r, g, b) {
+  emit(sprintf("%.3f %.3f %.3f RG %.2f w %.2f %.2f m %.2f %.2f l S", r, g, b, lw, x1, y, x2, y))
+}
+function txt(fnt, sz, x, y, r, g, b, s) {
+  emit(sprintf("%.3f %.3f %.3f rg BT /%s %.2f Tf 1 0 0 1 %.2f %.2f Tm (%s) Tj ET",
+               r, g, b, fnt, sz, x, y, pesc(s)))
+}
+function room(h) { return (Y - h >= BOT) }
+
+# ---------- ruler-driven column bounds ----------
+function col_bounds(ruler,   i, ch, inrun) {
+  NB = 0; inrun = 0
+  for (i = 1; i <= length(ruler); i++) {
+    ch = substr(ruler, i, 1)
+    if (ch == "=") { if (!inrun) { NB++; BS[NB] = i; inrun = 1 } ; BE[NB] = i }
+    else inrun = 0
+  }
+  return NB
+}
+function cell(line, idx) {
+  if (idx == NB) return trim(substr(line, BS[idx]))
+  return trim(substr(line, BS[idx], BE[idx] - BS[idx] + 1))
+}
+
+# ---------- word-aware wrapping ----------
+function wrap_cell(s, cpc,   i, cut, lim) {
+  WN = 0
+  if (cpc < 1) cpc = 1
+  if (s == "") { WN = 1; WL[1] = ""; return 1 }
+  while (length(s) > cpc) {
+    if (WN >= 14) { WL[++WN] = substr(s, 1, cpc - 3) "..."; return WN }
+    cut = 0
+    lim = int(cpc * 0.55); if (lim < 2) lim = 2
+    for (i = cpc + 1; i >= lim; i--) if (substr(s, i, 1) == " ") { cut = i; break }
+    if (cut > 0) { WL[++WN] = trim(substr(s, 1, cut - 1)); s = substr(s, cut + 1) }
+    else         { WL[++WN] = substr(s, 1, cpc);           s = substr(s, cpc + 1) }
+    sub(/^ +/, "", s)
+  }
+  WL[++WN] = s
+  return WN
+}
+
+{ line = $0; sub(/\r$/, "", line); gsub(/\t/, "    ", line); L[++N] = line }
+
+END {
+  W = 842; H = 595; ML = 24; MT = 26; BOT = 34; PAD = 2.2
+  USE = W - 2 * ML
+  NP = 0; NO = 0
+
+  # ================= parse into preamble + sections =================
+  i = 1; nsec = 0; ncur = 0; npre = 0; havetitle = 0
+  while (i <= N) {
+    if (is_banner(L[i]) && (i + 2) <= N && is_banner(L[i+2]) && is_startitle(L[i+1])) {
+      if (havetitle) {
+        nsec++; STITLE[nsec] = curtitle; SN[nsec] = ncur
+        for (k = 1; k <= ncur; k++) SL[nsec, k] = CUR[k]
+      } else for (k = 1; k <= ncur; k++) PRE[++npre] = CUR[k]
+      curtitle = strip_stars(L[i+1]); havetitle = 1; ncur = 0; i += 3
+      continue
+    }
+    CUR[++ncur] = L[i]; i++
+  }
+  if (havetitle) {
+    nsec++; STITLE[nsec] = curtitle; SN[nsec] = ncur
+    for (k = 1; k <= ncur; k++) SL[nsec, k] = CUR[k]
+  }
+  if (nsec >= 1 && toupper(STITLE[1]) ~ /^SAP HANA STATEMENT HASH DATA COLLECTION/) {
+    npre = 0
+    for (k = 1; k <= SN[1]; k++) PRE[++npre] = SL[1, k]
+    for (s = 1; s < nsec; s++) {
+      STITLE[s] = STITLE[s+1]; SN[s] = SN[s+1]
+      for (k = 1; k <= SN[s+1]; k++) SL[s, k] = SL[s+1, k]
+    }
+    nsec--
+  }
+  for (k = 1; k <= npre; k++) {
+    p = index(PRE[k], ":")
+    if (p > 1 && substr(trim(PRE[k]), 1, 1) != "*") {
+      key = trim(substr(PRE[k], 1, p - 1)); val = trim(substr(PRE[k], p + 1))
+      if (key != "" && val != "" && !(key in META)) { META[key] = val; MORD[++NMETA] = key }
+    }
+  }
+
+  # ================= cover page =================
+  newpage()
+  txt("F2", 20, ML, Y - 16, 0.102, 0.184, 0.294, "SAP HANA Statement Hash Analysis")
+  Y -= 24
+  txt("F3", 9.5, ML, Y - 9, 0.353, 0.404, 0.451,
+      "Deep-dive diagnostic collected via HANA_SQL_StatementHash_DataCollector (SAP Note 1969700)")
+  Y -= 20
+  hline(ML, W - ML, Y, 1.2, 0.184, 0.435, 0.659)
+  Y -= 18
+  lw = 150
+  for (k = 1; k <= NMETA; k++) {
+    key = MORD[k]
+    rh = 15
+    rect(ML, Y - rh, lw, rh, 0.933, 0.953, 0.973)
+    hline(ML, W - ML, Y, 0.4, 0.78, 0.816, 0.855)
+    hline(ML, W - ML, Y - rh, 0.4, 0.78, 0.816, 0.855)
+    vline(ML, Y, Y - rh, 0.4, 0.78, 0.816, 0.855)
+    vline(ML + lw, Y, Y - rh, 0.4, 0.78, 0.816, 0.855)
+    vline(W - ML, Y, Y - rh, 0.4, 0.78, 0.816, 0.855)
+    txt("F2", 8, ML + 5, Y - 10.5, 0.102, 0.184, 0.294, key)
+    v = META[key]
+    if (length(v) > 150) v = substr(v, 1, 147) "..."
+    txt("F1", 8, ML + lw + 5, Y - 10.5, 0.126, 0.141, 0.169, v)
+    Y -= rh
+    if (!room(20)) break
+  }
+
+  # ================= sections =================
+  for (s = 1; s <= nsec; s++) {
+    if (!room(90)) newpage()
+    NO++; OTITLE[NO] = STITLE[s]; OPAGE[NO] = NP
+    section_header(STITLE[s])
+    if (toupper(trim(STITLE[s])) == "KEY FIGURES") render_keyfig(s)
+    else render_section(s)
+    Y -= 6
+  }
+
+  emit_pdf()
+}
+
+function section_header(t) {
+  CURSEC = t
+  if (!room(34)) newpage()
+  Y -= 4
+  rect(ML, Y - 16, USE, 16, 0.102, 0.184, 0.294)
+  txt("F2", 9.5, ML + 7, Y - 11.5, 1, 1, 1, toupper(t))
+  Y -= 22
+}
+
+# ---- one section: blank-line separated blocks ----
+function render_section(s,   k, nb, any) {
+  nb = 0; any = 0
+  for (k = 1; k <= SN[s]; k++) {
+    if (trim(SL[s, k]) == "") { if (nb > 0) { flush_block(nb); any = 1; nb = 0 } }
+    else BLK[++nb] = SL[s, k]
+  }
+  if (nb > 0) { flush_block(nb); any = 1 }
+  if (!any) {
+    if (!room(16)) newpage()
+    txt("F3", 8, ML + 4, Y - 9, 0.353, 0.404, 0.451, "No data returned for this section.")
+    Y -= 16
+  }
+}
+
+function flush_block(nb,   j, c) {
+  if (nb >= 2 && is_ruler(BLK[2])) {
+    col_bounds(BLK[2])
+    NCOL = NB
+    for (c = 1; c <= NCOL; c++) THDR[c] = cell(BLK[1], c)
+    NROW = 0
+    for (j = 3; j <= nb; j++) { NROW++; for (c = 1; c <= NCOL; c++) TROW[NROW, c] = cell(BLK[j], c) }
+    draw_table()
+  } else {
+    draw_pre(nb)
+  }
+}
+
+# ---- monospace paragraph block ----
+function draw_pre(nb,   j, fs, lead, cpl, n, x, i) {
+  fs = 6.6; lead = fs * 1.28; cpl = int((USE - 14) / (0.6 * fs))
+  for (j = 1; j <= nb; j++) {
+    n = wrap_cell(BLK[j], cpl)
+    for (i = 1; i <= n; i++) {
+      if (!room(lead + 2)) newpage()
+      vline(ML + 1.5, Y, Y - lead, 1.6, 0.184, 0.435, 0.659)
+      txt("F1", fs, ML + 8, Y - lead + 1.6, 0.126, 0.141, 0.169, WL[i])
+      Y -= lead
+    }
+  }
+  Y -= 5
+}
+
+# ---- real bordered table with repeating header + zebra rows ----
+function draw_table(   c, j, i, maxl, tot, fs, cw, sum, scale, nlines, rh, ytop, k, zebra) {
+  tot = 0
+  for (c = 1; c <= NCOL; c++) {
+    maxl = length(THDR[c])
+    for (j = 1; j <= NROW; j++) if (length(TROW[j, c]) > maxl) maxl = length(TROW[j, c])
+    if (maxl < 3) maxl = 3
+    if (maxl > 55) maxl = 55
+    CW[c] = maxl
+    tot += maxl
+  }
+  fs = USE / (0.6 * (tot + 2.6 * NCOL))
+  if (fs > 7.0) fs = 7.0
+  if (fs < 4.3) fs = 4.3
+  CHW = 0.6 * fs
+  TLEAD = fs * 1.22
+
+  sum = 0
+  for (c = 1; c <= NCOL; c++) { RW[c] = (CW[c] + 2.4) * CHW; sum += RW[c] }
+  scale = USE / sum
+  CX[1] = ML
+  for (c = 1; c <= NCOL; c++) {
+    COLW[c] = RW[c] * scale
+    CPC[c] = int((COLW[c] - 2 * PAD) / CHW)
+    if (CPC[c] < 1) CPC[c] = 1
+    CX[c + 1] = CX[c] + COLW[c]
+  }
+  CX[NCOL + 1] = ML + USE
+
+  HMAX = 1
+  for (c = 1; c <= NCOL; c++) {
+    HNL[c] = wrap_cell(THDR[c], CPC[c])
+    for (i = 1; i <= HNL[c]; i++) HLINE[c, i] = WL[i]
+    if (HNL[c] > HMAX) HMAX = HNL[c]
+  }
+  HDRH = HMAX * TLEAD + 4
+  if (!room(HDRH + TLEAD + 6)) newpage()
+  ytop = Y
+  draw_thead(fs)
+
+  zebra = 0
+  for (j = 1; j <= NROW; j++) {
+    nlines = 1
+    for (c = 1; c <= NCOL; c++) {
+      k = wrap_cell(TROW[j, c], CPC[c])
+      NLC[c] = k
+      for (i = 1; i <= k; i++) CLINE[c, i] = WL[i]
+      if (k > nlines) nlines = k
+    }
+    rh = nlines * TLEAD + 3
+    if (!room(rh)) {
+      table_verticals(ytop)
+      newpage()
+      if (CURSEC != "") {
+        txt("F3", 7.5, ML, Y - 8, 0.353, 0.404, 0.451, toupper(CURSEC) " (continued)")
+        Y -= 13
+      }
+      ytop = Y
+      draw_thead(fs)
+    }
+    if (zebra) rect(CX[1], Y - rh, USE, rh, 0.933, 0.953, 0.973)
+    for (c = 1; c <= NCOL; c++)
+      for (i = 1; i <= NLC[c]; i++)
+        txt("F1", fs, CX[c] + PAD, Y - i * TLEAD + 1.4, 0.126, 0.141, 0.169, CLINE[c, i])
+    Y -= rh
+    hline(CX[1], CX[NCOL + 1], Y, 0.35, 0.78, 0.816, 0.855)
+    zebra = 1 - zebra
+  }
+  table_verticals(ytop)
+  Y -= 7
+}
+
+function draw_thead(fs,   c, i) {
+  rect(CX[1], Y - HDRH, USE, HDRH, 0.102, 0.184, 0.294)
+  for (c = 1; c <= NCOL; c++)
+    for (i = 1; i <= HNL[c]; i++)
+      txt("F4", fs, CX[c] + PAD, Y - i * TLEAD + 1.6, 1, 1, 1, HLINE[c, i])
+  Y -= HDRH
+  hline(CX[1], CX[NCOL + 1], Y, 0.35, 0.78, 0.816, 0.855)
+}
+
+function table_verticals(ytop,   c) {
+  for (c = 1; c <= NCOL + 1; c++) vline(CX[c], ytop, Y, 0.35, 0.78, 0.816, 0.855)
+  hline(CX[1], CX[NCOL + 1], ytop, 0.35, 0.78, 0.816, 0.855)
+}
+
+# ================= PDF assembly =================
+function emit_pdf(   p, cnum, pnum, kids, c, j, onum, pgobj, e, startxref, foot) {
+  OROOT = 7 + 2 * NP
+  NOBJ = OROOT + NO
+  OFF = 0
+  o("%PDF-1.4")
+  printf "%%\xE2\xE3\xCF\xD3\n"; OFF += 6
+
+  XREF[1] = OFF
+  o("1 0 obj")
+  if (NO > 0) o("<< /Type /Catalog /Pages 2 0 R /Outlines " OROOT " 0 R /PageMode /UseOutlines >>")
+  else        o("<< /Type /Catalog /Pages 2 0 R >>")
+  o("endobj")
+
+  kids = ""
+  for (p = 1; p <= NP; p++) kids = kids (p > 1 ? " " : "") (8 + 2 * (p - 1)) " 0 R"
+  XREF[2] = OFF
+  o("2 0 obj"); o("<< /Type /Pages /Count " NP " /Kids [" kids "] >>"); o("endobj")
+
+  XREF[3] = OFF
+  o("3 0 obj"); o("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>"); o("endobj")
+  XREF[4] = OFF
+  o("4 0 obj"); o("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"); o("endobj")
+  XREF[5] = OFF
+  o("5 0 obj"); o("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"); o("endobj")
+  XREF[6] = OFF
+  o("6 0 obj"); o("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>"); o("endobj")
+
+  for (p = 1; p <= NP; p++) {
+    cnum = 7 + 2 * (p - 1); pnum = cnum + 1
+    foot = C[p]
+    foot = foot sprintf("0.184 0.435 0.659 RG 0.7 w %.2f 22 m %.2f 22 l S\n", ML, W - ML)
+    foot = foot sprintf("0.353 0.404 0.451 rg BT /F3 7 Tf 1 0 0 1 %.2f 12 Tm (%s) Tj ET\n", ML, pesc(FOOT))
+    foot = foot sprintf("0.353 0.404 0.451 rg BT /F3 7 Tf 1 0 0 1 %.2f 12 Tm (Page %d of %d) Tj ET",
+                        W - ML - 58, p, NP)
+    XREF[cnum] = OFF
+    o(cnum " 0 obj"); o("<< /Length " length(foot) " >>"); o("stream"); o(foot); o("endstream"); o("endobj")
+    XREF[pnum] = OFF
+    o(pnum " 0 obj")
+    o("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " W " " H "] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents " cnum " 0 R >>")
+    o("endobj")
+  }
+
+  if (NO > 0) {
+    XREF[OROOT] = OFF
+    o(OROOT " 0 obj")
+    o("<< /Type /Outlines /First " (OROOT + 1) " 0 R /Last " (OROOT + NO) " 0 R /Count " NO " >>")
+    o("endobj")
+    for (j = 1; j <= NO; j++) {
+      onum = OROOT + j; pgobj = 8 + 2 * (OPAGE[j] - 1)
+      e = "<< /Title (" pesc(OTITLE[j]) ") /Parent " OROOT " 0 R"
+      if (j > 1)  e = e " /Prev " (onum - 1) " 0 R"
+      if (j < NO) e = e " /Next " (onum + 1) " 0 R"
+      e = e " /Dest [" pgobj " 0 R /Fit] >>"
+      XREF[onum] = OFF
+      o(onum " 0 obj"); o(e); o("endobj")
+    }
+  }
+
+  startxref = OFF
+  o("xref"); o("0 " (NOBJ + 1))
+  printf "0000000000 65535 f \n"; OFF += 20
+  for (j = 1; j <= NOBJ; j++) { printf "%010d 00000 n \n", XREF[j]; OFF += 20 }
+  o("trailer"); o("<< /Size " (NOBJ + 1) " /Root 1 0 R >>")
+  o("startxref"); o(startxref "")
+  printf "%%%%EOF\n"
+}
+
+# KEY FIGURES: one logical table spread over several blank-line groups
+function render_keyfig(s,   k, nb, c, hdr, started) {
+  nb = 0; NROW = 0; started = 0
+  for (k = 1; k <= SN[s]; k++) {
+    if (trim(SL[s, k]) == "") continue
+    nb++
+    if (nb == 1) { hdr = SL[s, k]; continue }
+    if (nb == 2 && is_ruler(SL[s, k])) { col_bounds(SL[s, k]); NCOL = NB; started = 1; continue }
+    NROW++
+    for (c = 1; c <= NCOL; c++) TROW[NROW, c] = cell(SL[s, k], c)
+  }
+  if (!started) { render_section(s); return }
+  for (c = 1; c <= NCOL; c++) THDR[c] = cell(hdr, c)
+  draw_table()
+}
+AWKPDFEOF
+
+# --- optional high-fidelity PDF renderer (used only if reportlab exists) ---
+cat > "${PDF_SCRIPT}" <<'PYEOF'
+#!/usr/bin/env python3
+"""
+hana_report_to_pdf.py
+
+Converts the plain-text hdbsql output of HANA_SQL_StatementHash_DataCollector
+(SAP Note 1969700) into a formatted, multi-page landscape PDF report with a
+cover summary, a bookmarked/clickable table of contents, and every report
+section rendered as a proper table.
+
+Usage:
+    python3 hana_report_to_pdf.py <input.out> <output.pdf>
+"""
+import re
+import sys
+
+from reportlab.lib.pagesizes import landscape, A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, PageBreak
+)
+from reportlab.platypus.tableofcontents import TableOfContents
+
+if len(sys.argv) != 3:
+    print("Usage: python3 hana_report_to_pdf.py <input.out> <output.pdf>", file=sys.stderr)
+    sys.exit(1)
+
+SRC, OUT = sys.argv[1], sys.argv[2]
+
+NAVY = colors.HexColor("#1a2f4b")
+ACCENT = colors.HexColor("#2f6fa8")
+LIGHT = colors.HexColor("#eef3f8")
+GREY = colors.HexColor("#5a6773")
+
+# ---------- Load & unescape raw lines ----------
+raw_lines = []
+with open(SRC, "r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if line == "LINE":
+            continue
+        content = line[1:-1] if line.startswith('"') and line.endswith('"') else line
+        content = content.replace('\\"', '"')
+        raw_lines.append(content)
+
+# ---------- Split into sections by "****...*" banner blocks ----------
+def is_banner(l):
+    return bool(re.fullmatch(r"\*{5,}", l.strip()))
+
+sections = []
+i, n = 0, len(raw_lines)
+preamble = []
+current_title, current_lines = None, []
+while i < n:
+    l = raw_lines[i]
+    if (is_banner(l) and i + 2 < n and is_banner(raw_lines[i + 2])
+            and raw_lines[i + 1].strip().startswith("*") and raw_lines[i + 1].strip().endswith("*")):
+        if current_title is not None:
+            sections.append((current_title, current_lines))
+        elif current_lines:
+            preamble.extend(current_lines)
+        current_title = raw_lines[i + 1].strip().strip("*").strip()
+        current_lines = []
+        i += 3
+        continue
+    current_lines.append(l)
+    i += 1
+if current_title is not None:
+    sections.append((current_title, current_lines))
+
+if sections and sections[0][0].strip().upper().startswith("SAP HANA STATEMENT HASH DATA COLLECTION"):
+    _, preamble = sections.pop(0)
+
+# ---------- Helpers ----------
+def is_ruler(l):
+    s = l.strip()
+    return len(s) > 0 and set(s.replace(" ", "")) <= {"="} and s.count("=") >= 2
+
+def col_bounds(ruler):
+    return [[m.start(), m.end()] for m in re.finditer(r"=+", ruler)]
+
+def slice_row(line, bounds):
+    cells = []
+    for idx, (s, e) in enumerate(bounds):
+        cell = (line[s:] if idx == len(bounds) - 1 else line[s:e]) if s < len(line) else ""
+        cells.append(cell.strip())
+    return cells
+
+def split_blocks(lines):
+    blocks, cur = [], []
+    for l in lines:
+        if l.strip() == "":
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(l)
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+styles = getSampleStyleSheet()
+title_style = ParagraphStyle("TitleBig", parent=styles["Title"], textColor=NAVY, fontSize=24, spaceAfter=6)
+subtitle_style = ParagraphStyle("Sub", parent=styles["Normal"], textColor=GREY, fontSize=11, spaceAfter=2)
+section_style = ParagraphStyle("Sec", parent=styles["Heading1"], textColor=colors.white, fontSize=13,
+                               backColor=NAVY, borderPadding=(6, 8, 6, 8), spaceBefore=14, spaceAfter=8)
+toc_title_style = ParagraphStyle("TocTitle", parent=styles["Title"], textColor=NAVY, fontSize=18, spaceAfter=12)
+mono_style = ParagraphStyle("Mono", parent=styles["Normal"], fontName="Courier", fontSize=7.5, leading=9.5,
+                             textColor=colors.HexColor("#20242b"))
+cell_style = ParagraphStyle("Cell", parent=styles["Normal"], fontName="Helvetica", fontSize=7.2, leading=8.6,
+                             wordWrap="CJK")
+hdr_cell_style = ParagraphStyle("HdrCell", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.4,
+                                 leading=8.8, textColor=colors.white)
+note_style = ParagraphStyle("Note", parent=styles["Normal"], fontName="Helvetica-Oblique", fontSize=8, textColor=GREY)
+
+def esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;") if t else "&nbsp;"
+
+def compute_col_widths(header_cells, data_rows, avail_width, min_cm=1.55, max_cm=9.5, char_w=4.35):
+    ncols = len(header_cells)
+    maxlen = [len(h) for h in header_cells]
+    for row in data_rows:
+        for idx, c in enumerate(row):
+            if idx < ncols:
+                maxlen[idx] = max(maxlen[idx], len(c))
+    raw = [max(min_cm * cm, min(max_cm * cm, m * char_w)) for m in maxlen]
+    scale = avail_width / sum(raw)
+    return [w * scale for w in raw]
+
+def make_table(header_cells, data_rows, avail_width):
+    widths = compute_col_widths(header_cells, data_rows, avail_width)
+    tbl_data = [[Paragraph(esc(h), hdr_cell_style) for h in header_cells]]
+    for row in data_rows:
+        tbl_data.append([Paragraph(esc(c), cell_style) for c in row])
+    t = Table(tbl_data, colWidths=widths, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d0da")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return t
+
+def render_generic_section(lines, avail_width):
+    flows = []
+    blocks = split_blocks(lines)
+    if not blocks:
+        return [Paragraph("<i>No data returned for this section.</i>", note_style)]
+    for block in blocks:
+        if len(block) >= 2 and is_ruler(block[1]):
+            bounds = col_bounds(block[1])
+            header_cells = slice_row(block[0], bounds)
+            data_rows = [slice_row(l, bounds) for l in block[2:]]
+            flows.append(make_table(header_cells, data_rows, avail_width))
+        else:
+            text = "<br/>".join(l.replace("&", "&amp;").replace("<", "&lt;").replace("\\n", "<br/>") for l in block)
+            flows.append(Paragraph(text, mono_style))
+        flows.append(Spacer(1, 8))
+    return flows
+
+def render_key_figures(lines, avail_width):
+    """KEY FIGURES is one logical table whose rows are split across several
+    blank-line-separated groups in the raw output; merge them back into a
+    single continuous table instead of one table per group."""
+    blocks = split_blocks(lines)
+    if not blocks:
+        return [Paragraph("<i>No data returned for this section.</i>", note_style)]
+    header_block = blocks[0]
+    bounds = col_bounds(header_block[1])
+    header_cells = slice_row(header_block[0], bounds)
+    data_rows = [slice_row(l, bounds) for l in header_block[2:]]
+    for block in blocks[1:]:
+        for l in block:
+            data_rows.append(slice_row(l, bounds))
+    return [make_table(header_cells, data_rows, avail_width), Spacer(1, 8)]
+
+# ---------- Document with TOC + outline bookmarks ----------
+class ReportDoc(SimpleDocTemplate):
+    def afterFlowable(self, flowable):
+        if isinstance(flowable, Paragraph) and flowable.style.name == "Sec":
+            text = flowable.getPlainText()
+            key = "sec-%d" % id(flowable) if not hasattr(flowable, "_bmkey") else flowable._bmkey
+            self.canv.bookmarkPage(key)
+            self.canv.addOutlineEntry(text, key, level=0, closed=False)
+            self.notify("TOCEntry", (0, text, self.page, key))
+
+doc = ReportDoc(
+    OUT, pagesize=landscape(A4),
+    leftMargin=1.4 * cm, rightMargin=1.4 * cm, topMargin=1.3 * cm, bottomMargin=1.3 * cm,
+    title="SAP HANA Statement Hash Analysis Report",
+)
+avail_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
+
+meta = {}
+for l in preamble:
+    if ":" in l and not l.strip().startswith("*"):
+        parts = re.split(r":\s+", l, maxsplit=1)
+        if len(parts) == 2:
+            meta[parts[0].strip()] = parts[1].strip()
+
+story = []
+
+# ----- Cover -----
+story.append(Paragraph("SAP HANA Statement Hash Analysis Report", title_style))
+story.append(Paragraph("Deep-dive diagnostic collected via HANA_SQL_StatementHash_DataCollector (SAP Note 1969700)",
+                        subtitle_style))
+story.append(Spacer(1, 10))
+story.append(HRFlowable(width="100%", thickness=1.4, color=ACCENT))
+story.append(Spacer(1, 10))
+
+info_rows = [
+    ["Statement Hash", meta.get("Statement hash", "")],
+    ["System / Database", meta.get("System ID / database name", "")],
+    ["Revision Level", meta.get("Revision level", "")],
+    ["Analysis Window", f'{meta.get("Start time", "")}  →  {meta.get("End time", "")}'],
+    ["Report Source", meta.get("Generated with", "")],
+]
+info_tbl = Table(
+    [[Paragraph(f"<b>{k}</b>", cell_style), Paragraph(esc(v), cell_style)] for k, v in info_rows],
+    colWidths=[5.5 * cm, avail_w - 5.5 * cm],
+)
+info_tbl.setStyle(TableStyle([
+    ("BACKGROUND", (0, 0), (0, -1), LIGHT),
+    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d0da")),
+    ("TOPPADDING", (0, 0), (-1, -1), 5),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+]))
+story.append(info_tbl)
+story.append(Spacer(1, 18))
+
+# ----- Table of contents -----
+story.append(Paragraph("Contents", toc_title_style))
+toc = TableOfContents()
+toc.levelStyles = [
+    ParagraphStyle(name="TOCLevel0", fontName="Helvetica", fontSize=10.5, leading=16,
+                    textColor=colors.HexColor("#1a2f4b")),
+]
+story.append(toc)
+story.append(PageBreak())
+
+# ----- Sections -----
+for title, lines in sections:
+    story.append(Paragraph(title, section_style))
+    if title.strip().upper() == "KEY FIGURES":
+        story.extend(render_key_figures(lines, avail_w))
+    else:
+        story.extend(render_generic_section(lines, avail_w))
+
+def add_page_furniture(canvas, doc_):
+    canvas.saveState()
+    canvas.setStrokeColor(ACCENT)
+    canvas.setLineWidth(1)
+    canvas.line(doc_.leftMargin, 1.0 * cm, landscape(A4)[0] - doc_.rightMargin, 1.0 * cm)
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(GREY)
+    canvas.drawString(doc_.leftMargin, 0.65 * cm,
+                       "SAP HANA Statement Hash Analysis  |  Statement Hash: " + meta.get("Statement hash", ""))
+    canvas.drawRightString(landscape(A4)[0] - doc_.rightMargin, 0.65 * cm, f"Page {doc_.page}")
+    canvas.restoreState()
+
+doc.multiBuild(story, onFirstPage=add_page_furniture, onLaterPages=add_page_furniture)
+print("Wrote", OUT)
+PYEOF
+
+# --- 1) always produce the cleaned plain-text version (feeds HTML + PDF) ---
+if ! "${AWK_BIN}" -f "${AWK_CLEAN}" "${OUTPUT_FILE}" > "${CLEAN_TXT}" 2>/dev/null; then
+  echo "WARNING: could not build cleaned text from ${OUTPUT_FILE}; report rendering skipped." >&2
+  REPORT_FORMAT="none"
 fi
+
+# --- 2) HTML report (awk only - works on every host, always succeeds) ---
+if [[ "${REPORT_FORMAT}" == "html" || "${REPORT_FORMAT}" == "both" || "${REPORT_FORMAT}" == "pdf" ]]; then
+  if "${AWK_BIN}" -v RSID="${db_sid} / ${db_name}" -v RHASH="${statement_hash}" \
+                  -v RGEN="$(hostname 2>/dev/null) at $(date '+%Y-%m-%d %H:%M:%S')" \
+                  -f "${AWK_HTML}" "${CLEAN_TXT}" > "${HTML_OUTPUT}" 2>/dev/null; then
+    [[ "${REPORT_FORMAT}" != "pdf" ]] && echo "HTML report written to ${HTML_OUTPUT}"
+  else
+    echo "WARNING: HTML report generation failed; the raw output at ${OUTPUT_FILE} is unaffected." >&2
+  fi
+fi
+
+# --- 3) PDF report: try every engine that might exist on this host ---
+find_reportlab_python() {
+  local c
+  for c in python3 python \
+           "/usr/sap/${db_sid}/HDB${db_inst_no}/exe/Python3/bin/python3" \
+           "/usr/sap/${db_sid}/HDB${db_inst_no}/exe/python_support/python3"; do
+    if have "$c" || [[ -x "$c" ]]; then
+      if "$c" -c 'import reportlab' >/dev/null 2>&1; then echo "$c"; return 0; fi
+    fi
+  done
+  return 1
+}
+
+generate_pdf() {
+  local eng="$1" py br lo c
+  case "${eng}" in
+    reportlab)
+      py="$(find_reportlab_python)" || return 1
+      "${py}" "${PDF_SCRIPT}" "${OUTPUT_FILE}" "${PDF_OUTPUT}" >/dev/null 2>&1 || return 1
+      ;;
+    wkhtmltopdf)
+      have wkhtmltopdf || return 1
+      [[ -s "${HTML_OUTPUT}" ]] || return 1
+      wkhtmltopdf --quiet --print-media-type --orientation Landscape --page-size A4 \
+        --margin-top 8mm --margin-bottom 8mm --margin-left 8mm --margin-right 8mm \
+        "${HTML_OUTPUT}" "${PDF_OUTPUT}" >/dev/null 2>&1 || return 1
+      ;;
+    chrome)
+      br=""
+      for c in chromium chromium-browser google-chrome google-chrome-stable microsoft-edge; do
+        have "$c" && { br="$c"; break; }
+      done
+      [[ -n "${br}" ]] || return 1
+      [[ -s "${HTML_OUTPUT}" ]] || return 1
+      "${br}" --headless --disable-gpu --no-sandbox --no-pdf-header-footer \
+        --print-to-pdf="${PDF_OUTPUT}" "file://${HTML_OUTPUT}" >/dev/null 2>&1 || return 1
+      ;;
+    weasyprint)
+      have weasyprint || return 1
+      [[ -s "${HTML_OUTPUT}" ]] || return 1
+      weasyprint "${HTML_OUTPUT}" "${PDF_OUTPUT}" >/dev/null 2>&1 || return 1
+      ;;
+    libreoffice)
+      lo=""
+      for c in soffice libreoffice; do have "$c" && { lo="$c"; break; }; done
+      [[ -n "${lo}" ]] || return 1
+      [[ -s "${HTML_OUTPUT}" ]] || return 1
+      "${lo}" --headless --convert-to pdf --outdir "${script_dir}" "${HTML_OUTPUT}" >/dev/null 2>&1 || return 1
+      ;;
+    awk)
+      LC_ALL=C "${AWK_BIN}" -v FOOT="${FOOTER_TEXT}" -f "${AWK_PDF}" "${CLEAN_TXT}" \
+        > "${PDF_OUTPUT}" 2>/dev/null || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ -s "${PDF_OUTPUT}" ]]
+}
+
+if [[ "${REPORT_FORMAT}" == "pdf" || "${REPORT_FORMAT}" == "both" ]]; then
+  if [[ "${PDF_ENGINE}" == "none" ]]; then
+    :
+  elif [[ "${PDF_ENGINE}" != "auto" ]]; then
+    if generate_pdf "${PDF_ENGINE}"; then
+      echo "PDF report written to ${PDF_OUTPUT} (engine: ${PDF_ENGINE})"
+    else
+      echo "WARNING: PDF engine '${PDF_ENGINE}' not available or failed on this host." >&2
+      echo "         Use the HTML report at ${HTML_OUTPUT}, or set PDF_ENGINE=awk." >&2
+    fi
+  else
+    pdf_done=0
+    for eng in reportlab wkhtmltopdf chrome weasyprint libreoffice awk; do
+      if generate_pdf "${eng}"; then
+        echo "PDF report written to ${PDF_OUTPUT} (engine: ${eng})"
+        pdf_done=1
+        break
+      fi
+    done
+    if [[ ${pdf_done} -eq 0 ]]; then
+      echo "WARNING: no PDF engine succeeded; use the HTML report at ${HTML_OUTPUT}" >&2
+      echo "         (open it in a browser and Print -> Save as PDF)." >&2
+    fi
+  fi
+fi
+
+# --- Publish the rendered report locations as Symphony variables ---
+# Guarded with -s (exists and is non-empty) rather than on REPORT_FORMAT or the
+# engine loop, so a format that was requested but failed to render leaves its
+# variable unpublished instead of pointing at a missing or truncated file.
+echo
+
+if [[ -s "${HTML_OUTPUT}" ]]; then
+  echo "HTML report path : ${HTML_OUTPUT}"
+  echo "##gbStart##htmlReportPath##splitKeyValue##${HTML_OUTPUT}##string##gbEnd##"
+fi
+
+if [[ -s "${PDF_OUTPUT}" ]]; then
+  echo "PDF report path  : ${PDF_OUTPUT}"
+  echo "##gbStart##pdfReportPath##splitKeyValue##${PDF_OUTPUT}##string##gbEnd##"
+fi
+
+exit 0
