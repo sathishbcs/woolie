@@ -1626,15 +1626,15 @@ echo "Top STATEMENT_HASH values: thread1='${thread1}' thread2='${thread2}' threa
 ## when a hash is missing - a bare && on the final line would leave the script
 ## exiting 1 and the calling step would read that as a failure.
 if [[ -n "${thread1}" ]]; then
-  echo "##gbStart##thread1##splitKeyValue##${thread1}##gbEnd##"
+  echo "##gbStart##thread1##splitKeyValue##${thread1}##splitKeyValue##string##gbEnd##"
 fi
 
 if [[ -n "${thread2}" ]]; then
-  echo "##gbStart##thread2##splitKeyValue##${thread2}##gbEnd##"
+  echo "##gbStart##thread2##splitKeyValue##${thread2}##splitKeyValue##string##gbEnd##"
 fi
 
 if [[ -n "${thread3}" ]]; then
-  echo "##gbStart##thread3##splitKeyValue##${thread3}##gbEnd##"
+  echo "##gbStart##thread3##splitKeyValue##${thread3}##splitKeyValue##string##gbEnd##"
 fi
 
 exit 0
