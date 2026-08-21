@@ -22,6 +22,53 @@ else
         exit 1
 fi
 
+## Symphony passes timestamps as a single whitespace-free token
+## (e.g. 2026/08/19_00:26:20) so the value survives unquoted expansion on the
+## command line. Turn the separator back into a space before it reaches the SQL,
+## which expects 'YYYY/MM/DD HH24:MI:SS'. Values already in the spaced form are
+## returned unchanged, as are the shortcut forms (C, C-H2, E-S900, MIN, MAX).
+##
+## Deliberately built from grep/sed and a case glob rather than bash's [[ =~ ]]:
+## it therefore also works if this script is ever run by a non-bash shell, and
+## it strips CR / stray whitespace / wrapping quotes first, so an argument that
+## arrives as $'2026/08/19_00:26:20\r' still normalises instead of silently
+## passing through and failing later inside HANA.
+normalize_time() {
+  v="${1}"
+  v="$(printf '%s' "${v}" | tr -d '\r\n' | sed -e "s/^[[:space:]'\"]*//" -e "s/[[:space:]'\"]*$//")"
+
+  ## accept  _  or  T  as the date/time separator, and - or / as the date separator
+  if printf '%s' "${v}" | grep -qE '^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}[_T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$'; then
+    v="$(printf '%s' "${v}" | sed -E 's#^([0-9]{4})[-/]([0-9]{2})[-/]([0-9]{2})[_T]#\1/\2/\3 #')"
+    case "${v}" in
+      *:*:*) : ;;
+      *) v="${v}:00" ;;          ## HH:MI supplied without seconds
+    esac
+  fi
+  printf '%s' "${v}"
+}
+
+begin_time_raw="${begin_time}"
+end_time_raw="${end_time}"
+begin_time="$(normalize_time "${begin_time}")"
+end_time="$(normalize_time "${end_time}")"
+
+## Hard guard: never let an unconverted timestamp reach HANA. Without this a
+## normalisation miss surfaces 20 seconds later as an opaque SQL error 303
+## ("invalid DATE, TIME or TIMESTAMP value ... at pos 25553") instead of here.
+check_time() {
+  case "${2}" in
+    *_*)
+      printf '%s' "${2}" | grep -qE '^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}[ _T]' && \
+        die "${1} was not normalised: received '${3}', still '${2}'. Expected YYYY/MM/DD_HH24:MI:SS or YYYY/MM/DD HH24:MI:SS."
+      ;;
+  esac
+}
+check_time BEGIN_TIME "${begin_time}" "${begin_time_raw}"
+check_time END_TIME   "${end_time}"   "${end_time_raw}"
+
+echo "Time normalisation: BEGIN '${begin_time_raw}' -> '${begin_time}' | END '${end_time_raw}' -> '${end_time}'" >&2
+
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_sid}"    ## tenant/system database name for -d, assumed same as SID
 
@@ -4315,15 +4362,21 @@ fi
 # ===========================================================================
 # Publish rendered report locations as Symphony global variables.
 #
+# Every date/time in a key or value uses '_' as the date-time separator, never
+# a space, so the value survives unquoted expansion in Symphony:
+#   run_id       20260821_083255            (YYYYMMDD_HHMMSS)
+#   generatedAt  2026-08-21_08:32:55        (human readable, still no space)
+#   window       2026/08/19_00:26:20        (begin/end, re-joined with '_')
+#
 # Key scheme (every key starts with a letter; hash/SID normalised to [A-Za-z0-9_]):
 #   HSH_<SID>_<HASH>_<RUNID>_<kind>  unique per run  -> history, never overwritten
 #   HSH_<SID>_<HASH>_<kind>          latest run for THIS statement hash
 #   HSH_LAST_<kind>                  latest run, any hash -> stable name for
 #                                    downstream steps (mail, attach, ticket)
 #
-# Guarded with -s (file exists and is non-empty) rather than on REPORT_FORMAT,
-# so a format that was requested but failed to render leaves its variable
-# unpublished instead of pointing at a missing or truncated file.
+# Guarded with -s (file exists and is non-empty) rather than on REPORT_FORMAT or
+# the engine loop, so a format that was requested but failed to render leaves
+# its variable unpublished instead of pointing at a missing or truncated file.
 # ===========================================================================
 
 gb_put() {   # gb_put <key> <value>
@@ -4332,9 +4385,16 @@ gb_put() {   # gb_put <key> <value>
 
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'; }
 
+# Space -> underscore, so a timestamp is always one whitespace-free token.
+# Inverse of normalize_time() at the top of this script.
+underscore_time() { printf '%s' "${1// /_}"; }
+
 hash_key="$(sanitize "${statement_hash}")"
 sid_key="$(sanitize "${db_sid}")"
-run_id="${ts}"                          # YYYYMMDD_HHMMSS, set before the SQL run
+run_id="${ts}"                              # YYYYMMDD_HHMMSS, set before the SQL run
+generated_at="$(date '+%Y-%m-%d_%H:%M:%S')" # underscore, not a space
+begin_us="$(underscore_time "${begin_time}")"
+end_us="$(underscore_time "${end_time}")"
 prefix="HSH_${sid_key}_${hash_key}"
 
 publish() {  # publish <kind> <path>
@@ -4355,16 +4415,23 @@ publish rawOutputPath  "${OUTPUT_FILE}"
 gb_put "HSH_LAST_statementHash" "${statement_hash}"
 gb_put "HSH_LAST_sid"           "${db_sid}"
 gb_put "HSH_LAST_runId"         "${run_id}"
+gb_put "HSH_LAST_generatedAt"   "${generated_at}"
+gb_put "HSH_LAST_beginTime"     "${begin_us}"
+gb_put "HSH_LAST_endTime"       "${end_us}"
+
 gb_put "${prefix}_runId"        "${run_id}"
+gb_put "${prefix}_generatedAt"  "${generated_at}"
+gb_put "${prefix}_beginTime"    "${begin_us}"
+gb_put "${prefix}_endTime"      "${end_us}"
 
 # --- append-only run history (global variables cannot be appended to) --------
 INDEX_FILE="${script_dir}/report_index.csv"
 if [[ ! -f "${INDEX_FILE}" ]]; then
-  echo "run_id,sid,db,statement_hash,begin_time,end_time,raw,txt,html,pdf" > "${INDEX_FILE}"
+  echo "run_id,generated_at,sid,db,statement_hash,begin_time,end_time,raw,txt,html,pdf" > "${INDEX_FILE}"
 fi
-printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-  "${run_id}" "${db_sid}" "${db_name}" "${statement_hash}" \
-  "${begin_time}" "${end_time}" \
+printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  "${run_id}" "${generated_at}" "${db_sid}" "${db_name}" "${statement_hash}" \
+  "${begin_us}" "${end_us}" \
   "${OUTPUT_FILE}" "${CLEAN_TXT}" "${HTML_OUTPUT}" "${PDF_OUTPUT}" >> "${INDEX_FILE}"
 gb_put "HSH_reportIndexPath" "${INDEX_FILE}"
 
