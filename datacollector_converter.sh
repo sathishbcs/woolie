@@ -76,6 +76,17 @@ done
 if [[ ${#HASH_LIST[@]} -eq 0 ]]; then
   die "no usable statement hash found in '${statement_hash}'"
 fi
+if [[ ${#HASH_LIST[@]} -gt 3 ]]; then
+  die "at most 3 statement hashes are supported, got ${#HASH_LIST[@]} in '${statement_hash}'"
+fi
+
+## Fixed result slots. The marker names published at the end of the script are
+## written out literally (statementHash1, htmlReportPath1, ...) rather than
+## built with a loop counter, so the orchestrating platform can find them by
+## scanning this file.
+statementHash1=""; htmlReportPath1=""; pdfReportPath1=""
+statementHash2=""; htmlReportPath2=""; pdfReportPath2=""
+statementHash3=""; htmlReportPath3=""; pdfReportPath3=""
 
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_tenant}"    ## tenant / system database name passed to hdbsql -d
@@ -3201,9 +3212,12 @@ for statement_hash in "${HASH_LIST[@]}"; do
 hash_idx=$(( hash_idx + 1 ))
 echo "=== [${hash_idx}/${hash_total}] statement hash ${statement_hash} ===" >&2
 
-## Published up front so the variable is set even if this hash later fails,
-## keeping the serial numbering aligned with the report path variables.
-echo "##gbStart##statementHash${hash_idx}##splitKeyValue##${statement_hash}##splitKeyValue##string##gbEnd##"
+## Recorded in a numbered slot; the markers are printed literally at the end.
+case ${hash_idx} in
+  1) statementHash1="${statement_hash}" ;;
+  2) statementHash2="${statement_hash}" ;;
+  3) statementHash3="${statement_hash}" ;;
+esac
 
 ts="$(date +%Y%m%d_%H%M%S)"
 TMP_SQL="${script_dir}/hana_statement_hash_${db_tenant}_${statement_hash}_${ts}.sql"
@@ -4402,12 +4416,20 @@ echo "Statement hash ${hash_idx} : ${statement_hash}"
 
 if [[ -s "${HTML_OUTPUT}" ]]; then
   echo "HTML report path : ${HTML_OUTPUT}"
-  echo "##gbStart##htmlReportPath${hash_idx}##splitKeyValue##${HTML_OUTPUT}##splitKeyValue##string##gbEnd##"
+  case ${hash_idx} in
+    1) htmlReportPath1="${HTML_OUTPUT}" ;;
+    2) htmlReportPath2="${HTML_OUTPUT}" ;;
+    3) htmlReportPath3="${HTML_OUTPUT}" ;;
+  esac
 fi
 
 if [[ -s "${PDF_OUTPUT}" ]]; then
   echo "PDF report path  : ${PDF_OUTPUT}"
-  echo "##gbStart##pdfReportPath${hash_idx}##splitKeyValue##${PDF_OUTPUT}##splitKeyValue##string##gbEnd##"
+  case ${hash_idx} in
+    1) pdfReportPath1="${PDF_OUTPUT}" ;;
+    2) pdfReportPath2="${PDF_OUTPUT}" ;;
+    3) pdfReportPath3="${PDF_OUTPUT}" ;;
+  esac
 fi
 
 ## The revision was already reported and checked on the first pass; skip the
@@ -4416,8 +4438,44 @@ SKIP_VERSION_CHECK=1
 
 done
 
+## ---------------------------------------------------------------------------
+## Published variables. Every marker name below is written out in full so the
+## orchestrating platform can find it by scanning this script; only the values
+## are substituted. Each line is guarded, so a slot that was not filled (fewer
+## than three hashes supplied, or a hash that failed) publishes nothing rather
+## than an empty value.
+## ---------------------------------------------------------------------------
 echo
-echo "##gbStart##statementHashCount##splitKeyValue##${hash_total}##splitKeyValue##string##gbEnd##"
+
+if [[ -n "${statementHash1}" ]]; then
+  echo "##gbStart##statementHash1##splitKeyValue##${statementHash1}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${htmlReportPath1}" ]]; then
+  echo "##gbStart##htmlReportPath1##splitKeyValue##${htmlReportPath1}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${pdfReportPath1}" ]]; then
+  echo "##gbStart##pdfReportPath1##splitKeyValue##${pdfReportPath1}##splitKeyValue##string##gbEnd##"
+fi
+
+if [[ -n "${statementHash2}" ]]; then
+  echo "##gbStart##statementHash2##splitKeyValue##${statementHash2}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${htmlReportPath2}" ]]; then
+  echo "##gbStart##htmlReportPath2##splitKeyValue##${htmlReportPath2}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${pdfReportPath2}" ]]; then
+  echo "##gbStart##pdfReportPath2##splitKeyValue##${pdfReportPath2}##splitKeyValue##string##gbEnd##"
+fi
+
+if [[ -n "${statementHash3}" ]]; then
+  echo "##gbStart##statementHash3##splitKeyValue##${statementHash3}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${htmlReportPath3}" ]]; then
+  echo "##gbStart##htmlReportPath3##splitKeyValue##${htmlReportPath3}##splitKeyValue##string##gbEnd##"
+fi
+if [[ -n "${pdfReportPath3}" ]]; then
+  echo "##gbStart##pdfReportPath3##splitKeyValue##${pdfReportPath3}##splitKeyValue##string##gbEnd##"
+fi
 
 if [[ ${failed_count} -gt 0 ]]; then
   echo "WARNING: ${failed_count} of ${hash_total} statement hash(es) failed; see messages above." >&2
