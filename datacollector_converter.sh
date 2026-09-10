@@ -3193,7 +3193,6 @@ SQL_EOF
 ## from the single-hash version. Body statements are deliberately left at their
 ## original indentation to keep this a small, reviewable change.
 ## ===========================================================================
-overall_rc=0
 failed_count=0
 hash_total=${#HASH_LIST[@]}
 hash_idx=0
@@ -3201,6 +3200,10 @@ hash_idx=0
 for statement_hash in "${HASH_LIST[@]}"; do
 hash_idx=$(( hash_idx + 1 ))
 echo "=== [${hash_idx}/${hash_total}] statement hash ${statement_hash} ===" >&2
+
+## Published up front so the variable is set even if this hash later fails,
+## keeping the serial numbering aligned with the report path variables.
+echo "##gbStart##statementHash${hash_idx}##splitKeyValue##${statement_hash}##splitKeyValue##string##gbEnd##"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 TMP_SQL="${script_dir}/hana_statement_hash_${db_tenant}_${statement_hash}_${ts}.sql"
@@ -3323,7 +3326,7 @@ if [[ ${hdbsql_rc} -ne 0 ]]; then
     echo "needs a different collector variant from SAP Note 1969700 (pass it via SQL_FILE=...)." >&2
   fi
   echo "ERROR: hdbsql execution failed for ${statement_hash} (rc=${hdbsql_rc}, log: ${ERR_FILE})" >&2
-  overall_rc=1
+
   failed_count=$(( failed_count + 1 ))
   continue
 fi
@@ -4396,7 +4399,6 @@ fi
 # variable unpublished instead of pointing at a missing or truncated file.
 echo
 echo "Statement hash ${hash_idx} : ${statement_hash}"
-echo "##gbStart##statementHash${hash_idx}##splitKeyValue##${statement_hash}##splitKeyValue##string##gbEnd##"
 
 if [[ -s "${HTML_OUTPUT}" ]]; then
   echo "HTML report path : ${HTML_OUTPUT}"
@@ -4421,4 +4423,8 @@ if [[ ${failed_count} -gt 0 ]]; then
   echo "WARNING: ${failed_count} of ${hash_total} statement hash(es) failed; see messages above." >&2
 fi
 
-exit ${overall_rc}
+## Always exit 0. A non-zero exit makes the orchestrating platform mark the
+## step failed, and a failed step discards the variables published above - so
+## one bad hash would throw away the reports produced for the good ones.
+## Failures are still visible in the log and in the warning line above.
+exit 0
