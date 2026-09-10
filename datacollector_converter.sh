@@ -17,7 +17,11 @@ if [ "$#" -eq 9 ]; then
         db_password=${5}     ## DB password, or 'none' to use hdbuserstore key <schemaName>
         begin_time=${6}      ## BEGIN_TIME for statement hash data collection window
         end_time=${7}        ## END_TIME for statement hash data collection window
-        statement_hash=${8}  ## STATEMENT_HASH to analyze (mandatory)
+        statement_hash=${8}  ## STATEMENT_HASH(es) to analyze (mandatory). A single hash,
+                             ## or several separated by commas:
+                             ##   9feecb4e...,3377dcc1...,e1e74651...
+                             ## Each hash is analyzed in turn and its report paths are
+                             ## published with a serial number (1, 2, 3, ...).
         script_dir=${9}/hana_dbop_comparison
 
         ## Convenience: an empty value or the literal 'same'/'none' means the tenant
@@ -54,6 +58,23 @@ end_time="$(normalize_time "${end_time}")"
 ## confusing hdbsql connection error later on.
 if [[ -z "${db_tenant}" ]] || ! [[ "${db_tenant}" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
         die "tenant_db_sid must be a valid database name, got '${db_tenant}'"
+fi
+
+## Split STATEMENT_HASH on commas into a list. Surrounding whitespace is
+## stripped so "hash1, hash2 , hash3" works as well as "hash1,hash2,hash3".
+IFS=',' read -r -a RAW_HASHES <<< "${statement_hash}"
+HASH_LIST=()
+for _h in "${RAW_HASHES[@]}"; do
+  _h="${_h#"${_h%%[![:space:]]*}"}"   ## strip leading whitespace
+  _h="${_h%"${_h##*[![:space:]]}"}"   ## strip trailing whitespace
+  [[ -z "${_h}" ]] && continue
+  if ! [[ "${_h}" =~ ^[A-Za-z0-9_%]+$ ]]; then
+    die "statement_hash entry '${_h}' contains characters that are not valid in a hash"
+  fi
+  HASH_LIST+=("${_h}")
+done
+if [[ ${#HASH_LIST[@]} -eq 0 ]]; then
+  die "no usable statement hash found in '${statement_hash}'"
 fi
 
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
@@ -3166,10 +3187,25 @@ ORDER BY
 WITH HINT (IGNORE_PLAN_CACHE)
 SQL_EOF
 
+## ===========================================================================
+## Everything from here to the matching "done" runs once per statement hash.
+## The loop variable is called statement_hash so the body below is unchanged
+## from the single-hash version. Body statements are deliberately left at their
+## original indentation to keep this a small, reviewable change.
+## ===========================================================================
+overall_rc=0
+failed_count=0
+hash_total=${#HASH_LIST[@]}
+hash_idx=0
+
+for statement_hash in "${HASH_LIST[@]}"; do
+hash_idx=$(( hash_idx + 1 ))
+echo "=== [${hash_idx}/${hash_total}] statement hash ${statement_hash} ===" >&2
+
 ts="$(date +%Y%m%d_%H%M%S)"
-TMP_SQL="${script_dir}/hana_statement_hash_${db_tenant}_${ts}.sql"
-OUTPUT_FILE="${script_dir}/hana_statement_hash_${db_tenant}_${ts}.out"
-ERR_FILE="${script_dir}/hana_statement_hash_${db_tenant}_${ts}.err"
+TMP_SQL="${script_dir}/hana_statement_hash_${db_tenant}_${statement_hash}_${ts}.sql"
+OUTPUT_FILE="${script_dir}/hana_statement_hash_${db_tenant}_${statement_hash}_${ts}.out"
+ERR_FILE="${script_dir}/hana_statement_hash_${db_tenant}_${statement_hash}_${ts}.err"
 
 # --- optional: use an external SQL template instead of the embedded one, e.g.
 #     the revision-specific variant downloaded from SAP Note 1969700.
@@ -3286,7 +3322,10 @@ if [[ ${hdbsql_rc} -ne 0 ]]; then
     echo "make sure SQL_FIXUPS is not set to 0. If a window-function probe fails, this revision" >&2
     echo "needs a different collector variant from SAP Note 1969700 (pass it via SQL_FILE=...)." >&2
   fi
-  die "hdbsql execution failed (rc=${hdbsql_rc}, log: ${ERR_FILE})"
+  echo "ERROR: hdbsql execution failed for ${statement_hash} (rc=${hdbsql_rc}, log: ${ERR_FILE})" >&2
+  overall_rc=1
+  failed_count=$(( failed_count + 1 ))
+  continue
 fi
 
 rm -f "${ERR_FILE}"
@@ -4356,14 +4395,30 @@ fi
 # engine loop, so a format that was requested but failed to render leaves its
 # variable unpublished instead of pointing at a missing or truncated file.
 echo
+echo "Statement hash ${hash_idx} : ${statement_hash}"
+echo "##gbStart##statementHash${hash_idx}##splitKeyValue##${statement_hash}##splitKeyValue##string##gbEnd##"
 
 if [[ -s "${HTML_OUTPUT}" ]]; then
   echo "HTML report path : ${HTML_OUTPUT}"
-  echo "##gbStart##${statement_hash}_htmlReportPath##splitKeyValue##${HTML_OUTPUT}##splitKeyValue##string##gbEnd##"
+  echo "##gbStart##htmlReportPath${hash_idx}##splitKeyValue##${HTML_OUTPUT}##splitKeyValue##string##gbEnd##"
 fi
 
 if [[ -s "${PDF_OUTPUT}" ]]; then
   echo "PDF report path  : ${PDF_OUTPUT}"
-  echo "##gbStart##${statement_hash}_pdfReportPath##splitKeyValue##${PDF_OUTPUT}##splitKeyValue##string##gbEnd##"
+  echo "##gbStart##pdfReportPath${hash_idx}##splitKeyValue##${PDF_OUTPUT}##splitKeyValue##string##gbEnd##"
 fi
-exit 0
+
+## The revision was already reported and checked on the first pass; skip the
+## extra round trip for the remaining hashes.
+SKIP_VERSION_CHECK=1
+
+done
+
+echo
+echo "##gbStart##statementHashCount##splitKeyValue##${hash_total}##splitKeyValue##string##gbEnd##"
+
+if [[ ${failed_count} -gt 0 ]]; then
+  echo "WARNING: ${failed_count} of ${hash_total} statement hash(es) failed; see messages above." >&2
+fi
+
+exit ${overall_rc}
