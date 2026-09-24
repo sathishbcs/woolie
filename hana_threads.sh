@@ -5,9 +5,15 @@
 ##
 ## Usage: ./apply_thread_count.sh <original_script.sh> <new_script.sh>
 set -euo pipefail
-src="${1:?usage: $0 original.sh new.sh}"
-dst="${2:?usage: $0 original.sh new.sh}"
-[[ -r "${src}" ]] || { echo "cannot read ${src}" >&2; exit 1; }
+if [[ $# -ne 2 ]]; then
+  echo "This is a ONE-TIME converter, not the report script." >&2
+  echo "Usage: $0 <current_thread_samples_script.sh> <new_script_name.sh>" >&2
+  echo "Then run the NEW script with the HANA parameters + thread_count." >&2
+  exit 1
+fi
+src="$1"
+dst="$2"
+[[ -r "${src}" ]] || { echo "cannot read file '${src}' - pass the path of your CURRENT thread-samples script" >&2; exit 1; }
 [[ "$(readlink -f "${src}")" != "$(readlink -f "${dst}" 2>/dev/null || echo x)" ]] || { echo "output must differ from input" >&2; exit 1; }
 
 start=$(grep -n "^read -r -d '' SQL_TEMPLATE_CONTENT <<'SQL_EOF'" "${src}" | head -1 | cut -d: -f1)
@@ -26,7 +32,7 @@ die() {
   kill -s TERM "${TOP_PID}"
 }
 
-if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
+if [ "$#" -eq 9 ]; then
         db_sid=${1}          ## HANA installation SID (used for the hdbsql binary path)
         db_inst_no=${2}      ## HANA instance number
         db_tenant=${3}       ## tenant database name for hdbsql -d (e.g. SEC on an S08
@@ -37,9 +43,8 @@ if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
         begin_time=${6}      ## BEGIN_TIME for the thread sample window
         end_time=${7}        ## END_TIME for the thread sample window
         script_dir=${8}/hana_dbop_comparison
-        thread_count=${9:-3} ## OPTIONAL: number of top STATEMENT_HASH values to extract and
+        thread_count=${9}     ## MANDATORY: number of top STATEMENT_HASH values to extract and
                              ## publish (1-10). 3 -> thread1..thread3, 5 -> thread1..thread5.
-                             ## Default 3 keeps existing 8-parameter jobs unchanged.
 
         ## Convenience: an empty value or the literal 'same'/'none' means the tenant
         ## name equals the installation SID, which keeps single-tenant systems simple.
@@ -49,17 +54,16 @@ if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
         fi
 else
         echo "Parameter missing"
-        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time script_dir [thread_count]"
+        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time script_dir thread_count"
         echo "       tenant_db_sid is the database passed to hdbsql -d (e.g. SEC for installation S08)"
         echo "       use 'same' (or the SID itself) when the tenant name equals the installation SID"
         echo "       use SYSTEMDB to query the system database instead of a tenant"
-        echo "       thread_count (optional, 1-10, default 3) = how many top statement hashes to publish"
+        echo "       thread_count (mandatory, 1-10) = how many top statement hashes to publish"
         exit 1
 fi
 
 ## Validate thread_count early so a typo fails before the (long) SQL runs.
 MAX_THREADS=10
-[[ -z "${thread_count}" ]] && thread_count=3
 if ! [[ "${thread_count}" =~ ^[0-9]+$ ]] || (( 10#${thread_count} < 1 || 10#${thread_count} > MAX_THREADS )); then
         echo "ERROR: thread_count must be a number between 1 and ${MAX_THREADS}, got '${thread_count}'" >&2
         exit 1
