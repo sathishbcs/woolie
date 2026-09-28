@@ -7,7 +7,7 @@ die() {
   kill -s TERM "${TOP_PID}"
 }
 
-if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
+if [ "$#" -eq 9 ]; then
         db_sid=${1}          ## HANA installation SID (used for the hdbsql binary path)
         db_inst_no=${2}      ## HANA instance number
         db_tenant=${3}       ## tenant database name for hdbsql -d (e.g. SEC on an S08
@@ -18,7 +18,8 @@ if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
         begin_time=${6}      ## BEGIN_TIME for the thread sample window
         end_time=${7}        ## END_TIME for the thread sample window
         script_dir=${8}/hana_dbop_comparison
-        thread_count=${9:-3} ## number of top STATEMENT_HASH values to publish (optional, default 3)
+        thread_count=${9}    ## number of top STATEMENT_HASH values to publish as one
+                             ## comma-separated 'threads' value (mandatory)
 
         ## Convenience: an empty value or the literal 'same'/'none' means the tenant
         ## name equals the installation SID, which keeps single-tenant systems simple.
@@ -28,11 +29,11 @@ if [ "$#" -eq 8 ] || [ "$#" -eq 9 ]; then
         fi
 else
         echo "Parameter missing"
-        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time script_dir [thread_count]"
+        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time script_dir thread_count"
         echo "       tenant_db_sid is the database passed to hdbsql -d (e.g. SEC for installation S08)"
         echo "       use 'same' (or the SID itself) when the tenant name equals the installation SID"
         echo "       use SYSTEMDB to query the system database instead of a tenant"
-        echo "       thread_count = number of top STATEMENT_HASH values to return (optional, default 3)"
+        echo "       thread_count = number of top STATEMENT_HASH values returned as comma-separated 'threads' (mandatory, 1-100)"
         exit 1
 fi
 
@@ -1574,7 +1575,7 @@ HDBSQL_ARGS+=(-I "${TMP_SQL}" -o "${OUTPUT_FILE}")
 
 echo "Output written to ${OUTPUT_FILE}"
 
-# --- Extract the top N STATEMENT_HASH values (N = thread_count, default 3) ---
+# --- Extract the top N STATEMENT_HASH values (N = thread_count) ---
 # Rows are already ORDER BY sample count DESC.
 # hdbsql -o writes standard CSV: an unquoted header row, then quoted data rows, then a
 # trailing "N rows selected (...)" footer. TABLE_NAMES can itself contain embedded commas
@@ -1637,21 +1638,28 @@ done <<< "${top_hashes}"
 
 found=${#hash_list[@]}
 
+## Join all hashes into one comma-separated string: hash1,hash2,hash3,...
+## A bare $hash_list would expand to the first element only, so the array is
+## joined with "${hash_list[*]}" using IFS=','. IFS is changed only inside the
+## $( ) subshell, so the rest of the script is unaffected. Statement hashes are
+## hex strings and never contain a comma, so the list splits back cleanly.
+threads_csv="$(IFS=,; printf '%s' "${hash_list[*]}")"
+
 echo
 echo "Requested ${thread_count} STATEMENT_HASH value(s), found ${found}:"
 for i in "${!hash_list[@]}"; do
-  echo "  thread$((i + 1))='${hash_list[$i]}'"
+  echo "  $((i + 1)). ${hash_list[$i]}"
 done
+echo "  threads='${threads_csv}'"
 
 if (( found < thread_count )); then
   echo "WARNING: only ${found} distinct SQL statement hash(es) in the window (non-SQL threads are skipped)" >&2
 fi
 
-## One marker per hash: thread1 .. threadN. Only hashes that were found are
-## published, and nothing here can leave a non-zero status before "exit 0",
-## so the calling step does not read a short result as a failure.
-for i in "${!hash_list[@]}"; do
-  echo "##gbStart##thread$((i + 1))##splitKeyValue##${hash_list[$i]}##splitKeyValue##string##gbEnd##"
-done
+## One marker carrying every hash as a comma-separated list. When no SQL hash is
+## found the value is empty, so a later step that references 'threads' still gets
+## a defined (empty) variable. Nothing here can leave a non-zero status before
+## "exit 0", so the calling step does not read a short result as a failure.
+echo "##gbStart##threads##splitKeyValue##${threads_csv}##splitKeyValue##string##gbEnd##"
 
 exit 0
