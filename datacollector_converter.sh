@@ -7,7 +7,7 @@ die() {
   kill -s TERM "${TOP_PID}"
 }
 
-if [ "$#" -eq 9 ] || [ "$#" -eq 10 ]; then
+if [ "$#" -eq 9 ]; then
         db_sid=${1}          ## HANA installation SID (used for the hdbsql binary path)
         db_inst_no=${2}      ## HANA instance number
         db_tenant=${3}       ## tenant database name for hdbsql -d (e.g. SEC on an S08
@@ -23,10 +23,6 @@ if [ "$#" -eq 9 ] || [ "$#" -eq 10 ]; then
                              ## Each hash is analyzed in turn and its report paths are
                              ## published with a serial number (1, 2, 3, ...).
         script_dir=${9}/hana_dbop_comparison
-        thread_count=${10:-} ## OPTIONAL: number of statement hashes to collect and
-                             ## convert (1-10). With 3, only the first 3 hashes get
-                             ## .out / .html / .pdf; with 5, the first 5. When omitted,
-                             ## every supplied hash is processed.
 
         ## Convenience: an empty value or the literal 'same'/'none' means the tenant
         ## name equals the installation SID, which keeps single-tenant systems simple.
@@ -35,12 +31,11 @@ if [ "$#" -eq 9 ] || [ "$#" -eq 10 ]; then
                 db_tenant="${db_sid}"
         fi
 else
-        echo "Parameter missing"
-        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time statement_hash script_dir [thread_count]"
+        echo "Wrong number of parameters: expected 9, got $#"
+        echo "Usage: $0 db_sid db_inst_no tenant_db_sid schemaName db_password begin_time end_time statement_hash script_dir"
         echo "       tenant_db_sid is the database passed to hdbsql -d (e.g. SEC for installation S08)"
         echo "       use 'same' (or the SID itself) when the tenant name equals the installation SID"
         echo "       use SYSTEMDB to query the system database instead of a tenant"
-        echo "       thread_count (optional, 1-10) = how many statement hashes to collect and convert"
         exit 1
 fi
 
@@ -87,22 +82,6 @@ if [[ ${#HASH_LIST[@]} -gt ${MAX_SLOTS} ]]; then
   die "at most ${MAX_SLOTS} statement hashes are supported, got ${#HASH_LIST[@]} in '${statement_hash}'"
 fi
 
-## thread_count: how many of the supplied hashes to collect and convert.
-## Empty (9-parameter call) means "all of them", so existing jobs keep working.
-[[ -z "${thread_count}" ]] && thread_count=${#HASH_LIST[@]}
-if ! [[ "${thread_count}" =~ ^[0-9]+$ ]] || (( 10#${thread_count} < 1 || 10#${thread_count} > MAX_SLOTS )); then
-  die "thread_count must be a number between 1 and ${MAX_SLOTS}, got '${thread_count}'"
-fi
-thread_count=$(( 10#${thread_count} ))
-
-if (( thread_count < ${#HASH_LIST[@]} )); then
-  echo "NOTE: ${#HASH_LIST[@]} hashes supplied, thread_count=${thread_count} -> processing only the first ${thread_count}." >&2
-  echo "      Skipped: ${HASH_LIST[*]:thread_count}" >&2
-  HASH_LIST=("${HASH_LIST[@]:0:thread_count}")
-elif (( thread_count > ${#HASH_LIST[@]} )); then
-  echo "NOTE: thread_count=${thread_count} but only ${#HASH_LIST[@]} hash(es) supplied -> generating ${#HASH_LIST[@]} report set(s)." >&2
-fi
-
 ## Fixed result slots. The marker names published at the end of the script are
 ## written out literally (statementHash1, htmlReportPath1, ...) rather than
 ## built with a loop counter, so the orchestrating platform can find them by
@@ -117,6 +96,10 @@ statementHash7="";  htmlReportPath7="";  pdfReportPath7=""
 statementHash8="";  htmlReportPath8="";  pdfReportPath8=""
 statementHash9="";  htmlReportPath9="";  pdfReportPath9=""
 statementHash10=""; htmlReportPath10=""; pdfReportPath10=""
+
+## Zip archives with every HTML / PDF report of this run (built after the
+## per-hash loop, published as htmlZipPath / pdfZipPath).
+htmlZipPath="";     pdfZipPath=""
 
 HDBSQL_BIN="/usr/sap/${db_sid}/HDB${db_inst_no}/exe/hdbsql"
 db_name="${db_tenant}"    ## tenant / system database name passed to hdbsql -d
@@ -3229,17 +3212,18 @@ WITH HINT (IGNORE_PLAN_CACHE)
 SQL_EOF
 
 ## ===========================================================================
-## Everything from here to the matching "done" runs once per statement hash.
-## HASH_LIST has already been trimmed to thread_count entries above, so the
-## loop produces exactly thread_count report sets (or fewer, if fewer hashes
-## were supplied). The loop variable is called statement_hash so the body below
-## is unchanged from the single-hash version.
+## Everything from here to the matching "done" runs once per statement hash,
+## so every hash supplied in STATEMENT_HASH (up to 10) gets its own report set.
+## The loop variable is called statement_hash so the body below is unchanged
+## from the single-hash version.
 ## ===========================================================================
 failed_count=0
 hash_total=${#HASH_LIST[@]}
 hash_idx=0
+HTML_FILES=()    ## HTML reports produced in this run -> Threads_HTML.zip
+PDF_FILES=()     ## PDF reports produced in this run  -> Threads_PDF.zip
 
-echo "Processing ${hash_total} statement hash(es) (thread_count=${thread_count})" >&2
+echo "Processing ${hash_total} statement hash(es)" >&2
 
 for statement_hash in "${HASH_LIST[@]}"; do
 hash_idx=$(( hash_idx + 1 ))
@@ -3382,12 +3366,17 @@ echo "Output written to ${OUTPUT_FILE}"
 # Post-processing: render the raw hdbsql output as a readable report.
 #
 #   REPORT_FORMAT : html | pdf | both (default) | none
-#   PDF_ENGINE    : auto (default) | reportlab | wkhtmltopdf | chrome |
-#                   weasyprint | libreoffice | awk | none
+#   PDF_ENGINE    : auto (default) | awk | none   (auto and awk are the same:
+#                   the built-in awk PDF writer; none = HTML only)
+#
+# Both documents have the same layout, built from one shared model:
+#   1. Thread details    2. Job details    3. Time details
+#   4. Memory consumption details    5. Previous instances details
+# followed by the complete collector output, section by section.
 #
 # Nothing below can affect the SQL or the .out file. Every step is optional,
-# failures are warnings only, and the awk-based HTML/PDF renderers need no
-# python, no reportlab and no other package at all.
+# failures are warnings only, and the renderers are plain awk: no python, no
+# reportlab, no browser and no other package is needed.
 # ===========================================================================
 REPORT_FORMAT="${REPORT_FORMAT:-both}"
 PDF_ENGINE="${PDF_ENGINE:-auto}"
@@ -3397,15 +3386,14 @@ BASE="${OUTPUT_FILE%.out}"
 CLEAN_TXT="${BASE}.txt"
 HTML_OUTPUT="${BASE}.html"
 PDF_OUTPUT="${BASE}.pdf"
-PDF_SCRIPT="${script_dir}/hana_report_to_pdf.py"
 AWK_CLEAN="${script_dir}/hana_report_clean.awk"
 AWK_HTML="${script_dir}/hana_report_to_html.awk"
 AWK_PDF="${script_dir}/hana_report_to_pdf.awk"
+AWK_MODEL="${script_dir}/hana_report_model.awk"
+MODEL_FILE="${BASE}.model"
 FOOTER_TEXT="SAP HANA Statement Hash Analysis  |  ${db_sid} / ${db_name}  |  hash ${statement_hash}"
 
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# --- awk renderer 1/3: unquote the hdbsql -o output into plain report text ---
+# --- awk renderer 1/4: unquote the hdbsql -o output into plain report text ---
 cat > "${AWK_CLEAN}" <<'AWKCLEANEOF'
 {
   line = $0
@@ -3418,28 +3406,906 @@ cat > "${AWK_CLEAN}" <<'AWKCLEANEOF'
 }
 AWKCLEANEOF
 
-## ###########################################################################
-## >>>>>>>>>>  PASTE UNCHANGED RENDERING SECTION FROM YOUR CURRENT SCRIPT  <<<<<<<<<<
-##
-## Copy from your existing script, exactly as it is, everything from the line
-##     cat > "${AWK_HTML}" <<'AWKHTMLEOF'
-## down to the end of the PDF engine loop (just before the block that fills
-## htmlReportPath1-3 / pdfReportPath1-3 with the "case" statements).
-## That covers: AWK_HTML heredoc, AWK_PDF heredoc, PDF_SCRIPT (PYEOF) heredoc,
-## step 1 (clean txt), step 2 (HTML), find_reportlab_python, generate_pdf and
-## the PDF_ENGINE loop. None of it changes for thread_count.
-##
-## Do NOT paste the old "case ${hash_idx} in 1) htmlReportPath1=..." blocks -
-## the publish block below replaces them.
-## ###########################################################################
+# --- awk renderer 2/4: the report model --------------------------------------
+# Reads the plain report text and writes one record per line: the summary
+# blocks (thread, job, time, memory, previous instances) first, then every
+# section of the full report. The HTML and the PDF are both drawn from this
+# model, so the two documents always carry the same content in the same order.
+cat > "${AWK_MODEL}" <<'AWKMODELEOF'
+# Turns the cleaned collector report into a render model that the HTML and the
+# PDF renderer both read, so the two documents always carry the same content
+# in the same order: a short summary (thread, job, time, memory and previous
+# instance details) first, then every section of the full report.
+#
+# One record per line, fields separated by TAB:
+#   TITLE t | META label value | PREVIEW text | BLOCK n title | KV label value
+#   TABLE caption aligns col1..colN | ROW v1..vN | ENDTABLE | NOTE text
+#   DETAILS | SECTION title | HDR text | UL text | LINE text
+# Plain POSIX awk; nothing here needs gawk.
 
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function rtrim(s) { sub(/[ \t]+$/, "", s); return s }
+function fld(s) { gsub(/[\t\r]/, " ", s); return s }
+function detab(s,   i, n) {
+  while ((i = index(s, "\t")) > 0) {
+    n = 8 - ((i - 1) % 8)
+    s = substr(s, 1, i - 1) substr("        ", 1, n) substr(s, i + 1)
+  }
+  return s
+}
+function num(s) { gsub(/[^0-9.\-]/, "", s); return s + 0 }
+function isnum(s) { return (s ~ /^-?[0-9]+(\.[0-9]+)?$/) }
+function pretty(t,   w, n, i, out, u) {
+  if (t == "SAP HANA STATEMENT HASH DATA COLLECTION") return "Collection information"
+  n = split(tolower(t), w, " ")
+  out = ""
+  for (i = 1; i <= n; i++) {
+    u = toupper(w[i])
+    if (u ~ /^(SQL|OOM|MDS|LOB|NSE|HANA|SAP|ID)$/) w[i] = u
+    else if (i == 1) w[i] = toupper(substr(w[i], 1, 1)) substr(w[i], 2)
+    out = out (i > 1 ? " " : "") w[i]
+  }
+  return out
+}
+
+## ---- output helpers ---------------------------------------------------------
+function kv(label, value) { value = trim(value); if (value != "") { print "KV\t" fld(label) "\t" fld(value); nkv++ } }
+function note(s) { print "NOTE\t" fld(s) }
+function table(caption, aligns, cols) { print "TABLE\t" fld(caption) "\t" aligns "\t" cols; tabopen = 1 }
+function row(vals) { print "ROW\t" vals }
+function endtable() { print "ENDTABLE"; tabopen = 0 }
+function join(a, b, sep) { if (a == "") return b; if (b == "") return a; return a sep b }
+function add_unique(list, v, sep) { v = trim(v); if (v == "" || v == "?") return list; if (index(sep list sep, sep v sep)) return list; return join(list, v, sep) }
+function shorten(s, n) { s = trim(s); return (length(s) > n) ? substr(s, 1, n - 3) "..." : s }
+
+## ---- report structure -------------------------------------------------------
+function sec_of(title,   s) { for (s = 1; s <= nsec; s++) if (stitle[s] == title) return s; return 0 }
+function col_of(t, name,   c) { for (c = 1; c <= tncol[t]; c++) if (tcname[t, c] == name) return c; return 0 }
+## first table in section 'title' that has every column listed in 'need'
+function tab_find(title, need,   t, n, k, parts, ok) {
+  n = split(need, parts, " ")
+  for (t = 1; t <= ntab; t++) {
+    if (stitle[tsec[t]] != title) continue
+    ok = 1
+    for (k = 1; k <= n; k++) if (!col_of(t, parts[k])) { ok = 0; break }
+    if (ok) return t
+  }
+  return 0
+}
+## cell value of data row r, column 'name'. Columns are cut at the positions
+## of the ===== underline, each running to the end of its underline so a value
+## that is one character too wide on the left is still read completely.
+function cell(t, r, name,   c, ln, from) {
+  c = col_of(t, name); if (!c) return ""
+  ln = L[trow[t, r]]
+  from = (c == 1) ? 1 : tce[t, c - 1] + 1
+  if (c == tncol[t]) return trim(substr(ln, from))
+  return trim(substr(ln, from, tce[t, c] - from + 1))
+}
+function row_of(t, name, value,   r) { for (r = 1; r <= tnrow[t]; r++) if (cell(t, r, name) == value) return r; return 0 }
+
+function parse_sections(   i, cur) {
+  nsec = 0; cur = 0
+  for (i = 1; i <= N; i++) {
+    if (L[i] ~ /^\*+ *$/ && L[i + 1] ~ /^\* .* \* *$/ && L[i + 2] ~ /^\*+ *$/) {
+      if (cur) sto[cur] = i - 1
+      cur = ++nsec
+      stitle[cur] = trim(substr(rtrim(L[i + 1]), 2, length(rtrim(L[i + 1])) - 2))
+      sfrom[cur] = i + 3
+      banner[i] = banner[i + 1] = banner[i + 2] = 1
+      i += 2
+      continue
+    }
+    if (!cur && trim(L[i]) != "") { cur = ++nsec; stitle[cur] = "REPORT OUTPUT"; sfrom[cur] = i }
+  }
+  if (cur) sto[cur] = N
+}
+
+function parse_tables(   s, j, k, t, c, p, ln, nxt, q) {
+  ntab = 0
+  for (s = 1; s <= nsec; s++) {
+    for (j = sfrom[s] + 1; j <= sto[s]; j++) {
+      ln = rtrim(L[j])
+      if (ln !~ /^=+( +=+)*$/ || trim(L[j - 1]) == "" || isul[j - 1]) continue
+      t = ++ntab; tsec[t] = s; thdr[t] = j - 1; isul[j] = 1; ishdr[j - 1] = 1
+      c = 0; p = 1
+      while (match(substr(ln, p), /=+/)) {
+        c++
+        tcs[t, c] = p + RSTART - 1
+        tce[t, c] = tcs[t, c] + RLENGTH - 1
+        p = tce[t, c] + 1
+      }
+      tncol[t] = c
+      for (c = 1; c <= tncol[t]; c++) {
+        if (c == tncol[t]) tcname[t, c] = trim(substr(L[j - 1], (c == 1) ? 1 : tce[t, c - 1] + 1))
+        else tcname[t, c] = trim(substr(L[j - 1], (c == 1) ? 1 : tce[t, c - 1] + 1, tce[t, c] - ((c == 1) ? 0 : tce[t, c - 1])))
+      }
+      ## Rows run to the next blank line. A blank line only ends the table if
+      ## what follows is another table header (or the end of the section);
+      ## KEY FIGURES uses blank rows as group separators inside one table.
+      tnrow[t] = 0
+      for (k = j + 1; k <= sto[s]; k++) {
+        if (trim(L[k]) == "") {
+          for (nxt = k + 1; nxt <= sto[s] && trim(L[nxt]) == ""; nxt++) ;
+          if (nxt > sto[s] || rtrim(L[nxt + 1]) ~ /^=+( +=+)*$/) break
+          continue
+        }
+        if (rtrim(L[k + 1]) ~ /^=+( +=+)*$/) break
+        tnrow[t]++; trow[t, tnrow[t]] = k
+      }
+      j = k - 1
+    }
+  }
+}
+
+## ---- summary blocks -----------------------------------------------------------
+function key_figures(   t, r, lbl, from2) {
+  t = tab_find("KEY FIGURES", "STAT_NAME VALUE")
+  if (!t) return
+  for (r = 1; r <= tnrow[t]; r++) {
+    lbl = cell(t, r, "STAT_NAME")
+    if (lbl == "") continue
+    if (lbl ~ /^(Statement hash|Type \/ dist\. \/ engines|Application source|Database user name|Last connection ID)$/) {
+      from2 = tce[t, 1] + 1
+      kf[lbl] = trim(substr(L[trow[t, r]], from2))
+    } else {
+      kf[lbl] = cell(t, r, "VALUE"); kfx[lbl] = cell(t, r, "VALUE_PER_EXEC"); kfr[lbl] = cell(t, r, "VALUE_PER_ROW")
+    }
+  }
+}
+
+function block_threads(   t, r, s, tot, p) {
+  print "BLOCK\t1\tThread details"
+  nkv = 0
+  if (kf["Called thread count"] != "")
+    kv("Called threads", kf["Called thread count"] " in total" (kfx["Called thread count"] != "" ? ", " kfx["Called thread count"] " per execution" : ""))
+  t = tab_find("THREAD SAMPLES", "SAMPLES PERCENT HOST PORT THREAD_TYPE")
+  if (t && tnrow[t]) {
+    p = num(cell(t, 1, "PERCENT"))
+    if (p > 0) kv("Thread samples", int(num(cell(t, 1, "SAMPLES")) * 100 / p + 0.5) " in the analysis window")
+    s = ""
+    for (r = 1; r <= tnrow[t] && r <= 3; r++) s = join(s, cell(t, r, "THREAD_TYPE") " " cell(t, r, "PERCENT") "%", ", ")
+    kv("Main thread types", s)
+    kv("Host / port", cell(t, 1, "HOST") " : " cell(t, 1, "PORT"))
+  }
+  t = tab_find("THREAD SAMPLES", "AVG_PARALLELISM MAX_PARALLELISM")
+  if (t && tnrow[t]) {
+    kv("Parallelism (avg / max)", cell(t, 1, "AVG_PARALLELISM") " / " cell(t, 1, "MAX_PARALLELISM"))
+    kv("Max threads (total / running)", cell(t, 1, "MAX_TOTAL_THREADS") " / " cell(t, 1, "MAX_TOTAL_RUNNING_THREADS"))
+  }
+  t = tab_find("THREAD SAMPLES", "THREAD_TYPE THREAD_METHOD")
+  if (t && tnrow[t]) {
+    s = ""
+    for (r = 1; r <= tnrow[t] && r <= 3; r++) s = join(s, cell(t, r, "THREAD_METHOD") " " cell(t, r, "PERCENT") "%", ", ")
+    kv("Top thread methods", s)
+  }
+  t = tab_find("THREAD SAMPLES", "THREAD_STATE LOCK_NAME")
+  if (t && tnrow[t]) {
+    table("Where the threads spent their time (top 5 thread states)", "LLLRR", "Thread type\tThread state\tLock / wait object\tSamples\t%")
+    for (r = 1; r <= tnrow[t] && r <= 5; r++)
+      row(fld(cell(t, r, "THREAD_TYPE")) "\t" fld(cell(t, r, "THREAD_STATE")) "\t" fld(cell(t, r, "LOCK_NAME")) "\t" cell(t, r, "SAMPLES") "\t" cell(t, r, "PERCENT"))
+    endtable()
+  } else if (!sec_of("THREAD SAMPLES"))
+    note("No thread samples were recorded for this statement in the analysis window.")
+}
+
+function block_job(   t, r, s, s2, root) {
+  print "BLOCK\t2\tJob details"
+  nkv = 0
+  kv("Application source", kf["Application source"])
+  t = tab_find("THREAD SAMPLES", "PASSPORT_COMPONENT PASSPORT_ACTION")
+  if (t) {
+    s = ""; s2 = ""
+    for (r = 1; r <= tnrow[t] && r <= 3; r++) {
+      if (cell(t, r, "PASSPORT_ACTION") != "") s = join(s, cell(t, r, "PASSPORT_ACTION") " (" cell(t, r, "PERCENT") "%)", ", ")
+      s2 = add_unique(s2, cell(t, r, "PASSPORT_COMPONENT"), ", ")
+    }
+    kv("Job / transaction (passport action)", s)
+    kv("Application server", s2)
+  }
+  kv("Database user", kf["Database user name"])
+  t = tab_find("THREAD SAMPLES", "DB_USER APP_USER APP_NAME APP_SOURCE")
+  if (t) {
+    s = ""; s2 = ""
+    for (r = 1; r <= tnrow[t] && r <= 5; r++) { s = add_unique(s, cell(t, r, "APP_USER"), ", "); s2 = add_unique(s2, cell(t, r, "APP_NAME"), ", ") }
+    kv("Application user", s)
+    kv("Application name", s2)
+  } else {
+    t = tab_find("EXPENSIVE STATEMENTS TRACE", "START_TIME APP_USER")
+    if (t) { s = ""; for (r = 1; r <= tnrow[t] && r <= 10; r++) s = add_unique(s, cell(t, r, "APP_USER"), ", "); kv("Application user", s) }
+  }
+  t = tab_find("EXPENSIVE STATEMENTS TRACE", "START_TIME WORKLOAD_CLASS")
+  if (t) { s = ""; for (r = 1; r <= tnrow[t] && r <= 10; r++) s = add_unique(s, cell(t, r, "WORKLOAD_CLASS"), ", "); kv("Workload class", s) }
+  t = tab_find("THREAD SAMPLES", "CLIENT_IP CLIENT_PID")
+  if (t && tnrow[t]) kv("Client (IP / PID)", cell(t, 1, "CLIENT_IP") " / " cell(t, 1, "CLIENT_PID") (tnrow[t] > 1 ? "  (+" (tnrow[t] - 1) " more)" : ""))
+  t = tab_find("THREAD SAMPLES", "ROOT_STATEMENT_HASH STATEMENT_STRING")
+  if (t && tnrow[t]) {
+    root = cell(t, 1, "ROOT_STATEMENT_HASH")
+    if (root != "" && root != stmt_hash) kv("Called from (root statement)", root "  " shorten(cell(t, 1, "STATEMENT_STRING"), 70))
+  }
+  kv("Execution type / engines", kf["Type / dist. / engines"])
+  kv("Last connection ID", kf["Last connection ID"])
+  t = tab_find("THREAD SAMPLES", "DB_USER APP_USER APP_NAME APP_SOURCE")
+  if (t && tnrow[t] > 1) {
+    table("Callers seen in the thread samples", "LLLLRR", "Database user\tApplication user\tApplication name\tApplication source\tSamples\t%")
+    for (r = 1; r <= tnrow[t] && r <= 5; r++)
+      row(fld(cell(t, r, "DB_USER")) "\t" fld(cell(t, r, "APP_USER")) "\t" fld(cell(t, r, "APP_NAME")) "\t" fld(cell(t, r, "APP_SOURCE")) "\t" cell(t, r, "SAMPLES") "\t" cell(t, r, "PERCENT"))
+    endtable()
+  }
+  if (!nkv) note("The report does not identify the calling job or application for this statement.")
+}
+
+function block_time(   t, r, n, i, names, lbls, best, bestr, d, have_t) {
+  print "BLOCK\t3\tTime details"
+  nkv = 0
+  if (meta["Start time"] != "" || meta["End time"] != "") kv("Analysis window", meta["Start time"] " to " meta["End time"])
+  kv("Executions", kf["Executions"])
+  if (kf["Records"] != "") kv("Records", kf["Records"] (kfx["Records"] != "" ? "  (" kfx["Records"] " per execution)" : ""))
+  if (kf["Preparations"] != "") kv("Preparations", kf["Preparations"])
+  t = tab_find("EXPENSIVE STATEMENTS TRACE", "START_TIME DURATION_S")
+  if (t && tnrow[t]) {
+    best = -1; bestr = 0
+    for (r = 1; r <= tnrow[t]; r++) { d = cell(t, r, "DURATION_S"); if (isnum(d) && d + 0 > best) { best = d + 0; bestr = r } }
+    if (bestr) kv("Longest traced execution", cell(t, bestr, "DURATION_S") " s  on " cell(t, bestr, "START_TIME"))
+  }
+  n = split("Cursor duration|Execution time|CPU time|Preparation time|Table load time|Lock wait time|Network request time", names, "|")
+  split("Elapsed time (cursor duration)|Execution time|CPU time|Preparation time|Table load time|Lock wait time|Network request time", lbls, "|")
+  have_t = 0
+  for (i = 1; i <= n; i++) if (kf[names[i]] != "") have_t = 1
+  if (have_t) {
+    table("Time breakdown", "LRRR", "Measure\tTotal\tPer execution\tPer record")
+    for (i = 1; i <= n; i++) if (kf[names[i]] != "") row(lbls[i] "\t" kf[names[i]] "\t" kfx[names[i]] "\t" kfr[names[i]])
+    endtable()
+  }
+  if (!nkv && !have_t) note("No execution statistics were found for the analysis window.")
+}
+
+function block_memory(   t, r, cr, best, bestr, v, n, last) {
+  print "BLOCK\t4\tMemory consumption details"
+  nkv = 0
+  if (kfx["Memory size"] != "") kv("Average memory per execution", kfx["Memory size"])
+  t = tab_find("SQL CACHE", "SNAPSHOT_TIME PLAN_MEM_KB AVG_MEM_MB MAX_MEM_MB")
+  if (t) {
+    cr = row_of(t, "SNAPSHOT_TIME", "CURRENT")
+    if (cr) {
+      kv("Avg / max per execution (now)", cell(t, cr, "AVG_MEM_MB") " MB / " cell(t, cr, "MAX_MEM_MB") " MB")
+      kv("Plan size", cell(t, cr, "PLAN_MEM_KB") " KB")
+    }
+    best = -1; bestr = 0
+    for (r = 1; r <= tnrow[t]; r++) {
+      if (r == cr) continue
+      v = cell(t, r, "MAX_MEM_MB"); if (isnum(v) && v + 0 > best) { best = v + 0; bestr = r }
+    }
+    if (bestr) kv("Peak in plan cache history", cell(t, bestr, "MAX_MEM_MB") " MB  (snapshot " cell(t, bestr, "SNAPSHOT_TIME") ")")
+  }
+  t = tab_find("EXPENSIVE STATEMENTS TRACE", "START_TIME MEM_MB")
+  if (t && tnrow[t]) {
+    best = -1; bestr = 0
+    for (r = 1; r <= tnrow[t]; r++) { v = cell(t, r, "MEM_MB"); if (isnum(v) && v + 0 > best) { best = v + 0; bestr = r } }
+    if (bestr) kv("Peak in a traced execution", cell(t, bestr, "MEM_MB") " MB  on " cell(t, bestr, "START_TIME"))
+  }
+  if (kf["Memory size"] != "") kv("Total over all executions", kf["Memory size"])
+  if (kf["NSE I/O read size"] != "") kv("NSE I/O read", kf["NSE I/O read size"] (kfx["NSE I/O read size"] != "" ? "  (" kfx["NSE I/O read size"] " per execution)" : ""))
+  if (kf["Network request size"] != "") kv("Network request size", kf["Network request size"])
+  t = tab_find("OOM EVENTS", "OOM_TIME MEM_USED_GB")
+  if (t && tnrow[t])
+    kv("Out-of-memory events", tnrow[t] "  (latest " cell(t, 1, "OOM_TIME") ", " cell(t, 1, "MEM_USED_GB") " GB used, " cell(t, 1, "REASON") ")")
+  else if (nkv) kv("Out-of-memory events", "none in the analysis window")
+  t = tab_find("ACTIVE STATEMENTS", "START_TIME MEM_GB")
+  if (t && tnrow[t]) {
+    best = -1
+    for (r = 1; r <= tnrow[t]; r++) { v = cell(t, r, "MEM_GB"); if (isnum(v) && v + 0 > best) best = v + 0 }
+    kv("Running right now", tnrow[t] " active execution(s)" (best >= 0 ? ", up to " best " GB" : ""))
+  }
+  if (!nkv) note("No memory figures were found for this statement in the analysis window.")
+}
+
+function block_history(   t, m, mm, r, n, shown, cr, mr, first, last, ts) {
+  print "BLOCK\t5\tPrevious instances details"
+  nkv = 0; shown = 0
+  t = tab_find("EXPENSIVE STATEMENTS TRACE", "START_TIME DURATION_S MEM_MB")
+  if (t && tnrow[t]) {
+    kv("Traced executions", tnrow[t] (tnrow[t] > 10 ? "  (newest 10 shown)" : "") "  - expensive statements trace")
+  } else {
+    t = tab_find("EXECUTED STATEMENTS TRACE", "START_TIME DURATION_S")
+    if (t && tnrow[t]) kv("Traced executions", tnrow[t] (tnrow[t] > 10 ? "  (newest 10 shown)" : "") "  - executed statements trace")
+    else t = 0
+  }
+  m = tab_find("SQL CACHE", "SNAPSHOT_TIME EXECUTIONS AVG_EXEC_MS")
+  n = 0
+  if (m) {
+    cr = row_of(m, "SNAPSHOT_TIME", "CURRENT")
+    for (r = 1; r <= tnrow[m]; r++) if (r != cr) { n++; ts = cell(m, r, "SNAPSHOT_TIME"); if (n == 1) last = ts; first = ts }
+    if (n) kv("Plan cache snapshots", n "  (" first " to " last ")" (n > 10 ? ", newest 10 shown" : ""))
+  }
+  if (t) {
+    if (col_of(t, "MEM_MB")) {
+      table("Recent executions (newest first)", "LRRRRLLL", "Start time\tDuration (s)\tCPU (s)\tRecords\tMemory (MB)\tApplication user\tApplication source\tError")
+      for (r = 1; r <= tnrow[t] && r <= 10; r++)
+        row(cell(t, r, "START_TIME") "\t" cell(t, r, "DURATION_S") "\t" cell(t, r, "CPU_S") "\t" cell(t, r, "RECORDS") "\t" cell(t, r, "MEM_MB") "\t" \
+            fld(cell(t, r, "APP_USER")) "\t" fld(cell(t, r, "APP_SOURCE")) "\t" fld(cell(t, r, "ERROR") == "0" ? "" : cell(t, r, "ERROR")))
+    } else {
+      table("Recent executions (newest first)", "LRRLL", "Start time\tDuration (s)\tError\tApplication user\tApplication source")
+      for (r = 1; r <= tnrow[t] && r <= 10; r++)
+        row(cell(t, r, "START_TIME") "\t" cell(t, r, "DURATION_S") "\t" (cell(t, r, "ERROR") == "0" ? "" : fld(cell(t, r, "ERROR"))) "\t" fld(cell(t, r, "APP_USER")) "\t" fld(cell(t, r, "APP_SOURCE")))
+    }
+    endtable(); shown++
+  }
+  if (n) {
+    mm = tab_find("SQL CACHE", "SNAPSHOT_TIME PLAN_MEM_KB AVG_MEM_MB MAX_MEM_MB")
+    table("Plan cache history (one row per snapshot, newest first)", "LLRRRRRR", "Snapshot\tHost\tExecutions\tAvg exec (ms)\tAvg CPU (ms)\tRecords / exec\tAvg mem (MB)\tMax mem (MB)")
+    shown = 0
+    for (r = 1; r <= tnrow[m] && shown < 10; r++) {
+      if (r == cr) continue
+      ts = cell(m, r, "SNAPSHOT_TIME"); mr = mm ? row_of(mm, "SNAPSHOT_TIME", ts) : 0
+      row(ts "\t" fld(cell(m, r, "HOST")) "\t" cell(m, r, "EXECUTIONS") "\t" cell(m, r, "AVG_EXEC_MS") "\t" cell(m, r, "AVG_CPU_MS") "\t" cell(m, r, "REC_PER_EXEC") "\t" \
+          (mr ? cell(mm, mr, "AVG_MEM_MB") : "") "\t" (mr ? cell(mm, mr, "MAX_MEM_MB") : ""))
+      shown++
+    }
+    endtable()
+  }
+  if (!t && !n) note("No earlier executions or plan cache snapshots of this statement were recorded in the analysis window.")
+}
+
+## ---- main ---------------------------------------------------------------------
+{ sub(/\r$/, ""); if ($0 == "?") $0 = ""; L[++N] = $0 }
+
+END {
+  parse_sections()
+  parse_tables()
+  key_figures()
+
+  s = sec_of("SAP HANA STATEMENT HASH DATA COLLECTION")
+  if (s) for (i = sfrom[s]; i <= sto[s]; i++)
+    if (match(L[i], /^[A-Za-z][^:]*: /)) meta[substr(L[i], 1, RLENGTH - 2)] = trim(substr(L[i], RLENGTH + 1))
+  if (stmt_hash == "") stmt_hash = meta["Statement hash"]
+
+  print "TITLE\tSAP HANA Statement Hash Analysis"
+  if (meta["System ID / database name"] != "") print "META\tSystem / database\t" fld(meta["System ID / database name"])
+  if (meta["Revision level"] != "") print "META\tRevision\t" fld(meta["Revision level"])
+  print "META\tStatement hash\t" fld(meta["Statement hash"] != "" ? meta["Statement hash"] : stmt_hash)
+  if (meta["Plan ID"] != "") print "META\tPlan ID\t" fld(meta["Plan ID"])
+  if (meta["Start time"] != "" || meta["End time"] != "") print "META\tAnalysis window\t" fld(meta["Start time"] " to " meta["End time"])
+  s = sec_of("STATEMENT TEXT")
+  if (s) {
+    txt = ""
+    for (i = sfrom[s]; i <= sto[s]; i++) if (trim(L[i]) != "") txt = txt " " trim(L[i])
+    gsub(/[ \t]+/, " ", txt)
+    if (trim(txt) != "") print "PREVIEW\t" fld(shorten(txt, 420))
+  }
+
+  block_threads()
+  block_job()
+  block_time()
+  block_memory()
+  block_history()
+
+  print "DETAILS"
+  for (s = 1; s <= nsec; s++) {
+    a = sfrom[s]; b = sto[s]
+    while (a <= b && trim(L[a]) == "") a++
+    while (b >= a && trim(L[b]) == "") b--
+    if (a > b) continue
+    print "SECTION\t" fld(pretty(stitle[s]))
+    for (i = a; i <= b; i++) {
+      ln = rtrim(detab(L[i]))
+      if (isul[i]) print "UL\t" ln
+      else if (ishdr[i]) print "HDR\t" ln
+      else print "LINE\t" ln
+    }
+  }
+}
+AWKMODELEOF
+
+# --- awk renderer 3/4: model -> HTML page -----------------------------------
+cat > "${AWK_HTML}" <<'AWKHTMLEOF'
+# Model -> self-contained HTML page. Same content and order as the PDF: title,
+# summary blocks 1-5, then the full report section by section.
+BEGIN { FS = "\t"; footer = ENVIRON["REPORT_FOOTER"]; nd = 0; nt = 0; indetails = 0; inpre = 0 }
+
+function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s); return s }
+function emit(s) { if (indetails) D[++nd] = s; else print s }
+function closekv(   i) {
+  if (!nkv) return
+  print "<table class=\"kv\">"
+  for (i = 1; i <= nkv; i += 2)
+    print "<tr><th>" esc(kl[i]) "</th><td>" esc(kv_[i]) "</td>" (i + 1 <= nkv ? "<th>" esc(kl[i + 1]) "</th><td>" esc(kv_[i + 1]) "</td>" : "<th></th><td></td>") "</tr>"
+  print "</table>"
+  nkv = 0
+}
+function closepre() { if (inpre) { emit("</pre></section>"); inpre = 0 } }
+function closeblock() { closekv(); if (inblock) { print "</section>"; inblock = 0 } }
+
+$1 == "TITLE" { title = $2; next }
+$1 == "META"  { nm++; mlab[nm] = $2; mval[nm] = $3; if ($2 == "Statement hash") hash = $3; if ($2 == "System / database") sys = $3; next }
+$1 == "PREVIEW" { preview = $2; next }
+
+$1 == "BLOCK" {
+  if (!started) start_page()
+  closeblock()
+  print "<section class=\"block\" id=\"b" $2 "\"><h2><span class=\"n\">" $2 "</span>" esc($3) "</h2>"
+  inblock = 1; next
+}
+$1 == "KV" { nkv++; kl[nkv] = $2; kv_[nkv] = $3; next }
+$1 == "NOTE" { closekv(); print "<p class=\"note\">" esc($2) "</p>"; next }
+$1 == "TABLE" {
+  closekv()
+  ncol = NF - 3; aligns = $3
+  print "<div class=\"tw\"><table><caption>" esc($2) "</caption><thead><tr>"
+  for (i = 1; i <= ncol; i++) printf "<th%s>%s</th>", (substr(aligns, i, 1) == "R" ? " class=\"r\"" : ""), esc($(i + 3))
+  print "</tr></thead><tbody>"; next
+}
+$1 == "ROW" {
+  printf "<tr>"
+  for (i = 1; i <= ncol; i++) printf "<td%s>%s</td>", (substr(aligns, i, 1) == "R" ? " class=\"r\"" : ""), esc($(i + 1))
+  print "</tr>"; next
+}
+$1 == "ENDTABLE" { print "</tbody></table></div>"; next }
+
+$1 == "DETAILS" { if (!started) start_page(); closeblock(); indetails = 1; next }
+$1 == "SECTION" {
+  closepre()
+  nt++; T[nt] = $2
+  emit("<section class=\"sec\" id=\"s" nt "\"><h3>" esc($2) "</h3><pre>")
+  inpre = 1; next
+}
+$1 == "HDR"  { emit("<b>" esc(substr($0, 5)) "</b>"); next }
+$1 == "UL"   { emit("<span class=\"ul\">" esc(substr($0, 4)) "</span>"); next }
+$1 == "LINE" { emit(esc(substr($0, 6))); next }
+
+function start_page(   i) {
+  started = 1
+  print "<!DOCTYPE html>"
+  print "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+  print "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+  print "<title>" esc(title) (hash != "" ? " - " esc(hash) : "") (sys != "" ? " - " esc(sys) : "") "</title>"
+  print "<style>"
+  print ":root{--acc:#6B5DA7;--ink:#1f2330;--mut:#5d6272;--line:#e4e2ec;--soft:#f5f4f9}"
+  print "*{box-sizing:border-box}"
+  print "body{margin:0;background:#fff;color:var(--ink);font:14px/1.45 -apple-system,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif}"
+  print ".wrap{max-width:1200px;margin:0 auto;padding:28px 28px 40px}"
+  print "h1{margin:0 0 6px;font-size:24px;color:var(--acc)}"
+  print ".meta{color:var(--mut);font-size:13px}.meta span{display:inline-block;margin:0 22px 3px 0}"
+  print ".meta b{color:var(--ink);font-weight:600}"
+  print ".preview{margin:14px 0 4px;padding:9px 12px;background:var(--soft);border-left:3px solid var(--acc);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}"
+  print ".preview span{display:block;font:600 11px/1.4 -apple-system,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}"
+  print ".jump{margin:14px 0 0;font-size:13px;color:var(--mut)}"
+  print ".jump a{color:var(--acc);text-decoration:none;margin-right:14px}"
+  print ".block{margin:22px 0 0;border-top:2px solid var(--acc)}"
+  print ".block h2{margin:12px 0 10px;font-size:17px}"
+  print ".block h2 .n{display:inline-block;width:24px;height:24px;line-height:24px;margin-right:10px;border-radius:4px;background:var(--acc);color:#fff;font-size:13px;text-align:center;vertical-align:1px}"
+  print "table.kv{table-layout:fixed;margin:0 0 6px}"
+  print "table.kv th{width:19%;padding:5px 12px 5px 0;background:none;color:var(--mut);font-size:13px;white-space:normal;vertical-align:top}"
+  print "table.kv td{width:31%;padding:5px 30px 5px 0;word-break:break-word}"
+  print ".tw{overflow-x:auto}"
+  print "table{width:100%;border-collapse:collapse;margin:8px 0 14px;font-size:13px}"
+  print "caption{padding:4px 0;text-align:left;font-weight:600;color:var(--mut)}"
+  print "th{padding:6px 8px;background:var(--soft);border-bottom:1px solid var(--line);text-align:left;font-weight:600;white-space:nowrap}"
+  print "td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}"
+  print ".r{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}"
+  print ".note{margin:4px 0 10px;color:var(--mut);font-style:italic}"
+  print ".details{margin-top:34px;border-top:2px solid var(--acc)}"
+  print ".details h2{margin:12px 0 6px;font-size:17px}"
+  print ".toc{margin:0 0 6px;font-size:13px;columns:3}"
+  print ".toc a{color:var(--acc);text-decoration:none}"
+  print ".sec h3{margin:22px 0 6px;font-size:15px;color:var(--acc)}"
+  print "pre{margin:0;padding:10px 12px;overflow-x:auto;background:#fbfbfd;border:1px solid var(--line);font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+  print "pre .ul{color:#a9adba}"
+  print "footer{margin-top:30px;padding-top:8px;border-top:1px solid var(--line);color:var(--mut);font-size:12px}"
+  print "@media (max-width:860px){table.kv,table.kv tbody,table.kv tr{display:block;width:100%}table.kv th,table.kv td{display:inline-block;width:auto;border:0}table.kv th{width:42%}.toc{columns:1}}"
+  print "@media print{.wrap{max-width:none;padding:0}.jump{display:none}.block{break-inside:avoid}pre{white-space:pre-wrap;word-break:break-all;font-size:8.5px}a{color:inherit}}"
+  print "</style></head><body><div class=\"wrap\">"
+  print "<header><h1>" esc(title) "</h1><div class=\"meta\">"
+  for (i = 1; i <= nm; i++) print "<span>" esc(mlab[i]) ": <b>" esc(mval[i]) "</b></span>"
+  print "</div>"
+  if (preview != "") print "<div class=\"preview\"><span>Statement</span>" esc(preview) "</div>"
+  print "<nav class=\"jump\"><a href=\"#b1\">1 Threads</a><a href=\"#b2\">2 Job</a><a href=\"#b3\">3 Time</a><a href=\"#b4\">4 Memory</a><a href=\"#b5\">5 Previous instances</a><a href=\"#details\">Full report details</a></nav>"
+  print "</header>"
+}
+
+END {
+  if (!started) start_page()
+  closeblock()
+  closepre()
+  print "<section class=\"details\" id=\"details\"><h2>Full report details</h2>"
+  if (nt) {
+    printf "<p class=\"toc\">"
+    for (i = 1; i <= nt; i++) printf "<a href=\"#s%d\">%s</a><br>", i, esc(T[i])
+    print "</p>"
+  }
+  for (i = 1; i <= nd; i++) print D[i]
+  print "</section>"
+  if (footer != "") print "<footer>" esc(footer) "</footer>"
+  print "</div></body></html>"
+}
+AWKHTMLEOF
+
+# --- awk renderer 4/4: model -> PDF (A4 landscape, standard PDF fonts) -------
+cat > "${AWK_PDF}" <<'AWKPDFEOF'
+# Model -> PDF, same content and order as the HTML page. A4 landscape, the
+# standard PDF fonts (Helvetica, Courier) and nothing else, so no python,
+# reportlab or browser is needed. Run with LC_ALL=C: byte offsets in the xref
+# table are computed with length().
+BEGIN {
+  FS = "\t"
+  footer = ENVIRON["REPORT_FOOTER"]; created = ENVIRON["REPORT_CREATED"]
+  PW = 841.89; PH = 595.28; X0 = 36; X1 = PW - 36; W = X1 - X0
+  TOPY = PH - 34; BOTY = 52
+  ACC = "0.420 0.365 0.655"; INK = "0.122 0.137 0.188"; MUT = "0.365 0.384 0.447"
+  RULE = "0.894 0.886 0.925"; SOFT = "0.961 0.957 0.976"; FAINT = "0.62 0.63 0.67"; WHITE = "1 1 1"
+  for (i = 0; i < 256; i++) ORD[sprintf("%c", i)] = i
+  split("278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278 556 556 556 556 556 556 556 556 556 556 278 278 584 584 584 556 " \
+        "1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778 667 778 722 667 611 722 667 944 667 667 611 278 278 278 469 556 " \
+        "333 556 556 500 556 556 278 556 556 222 222 500 222 833 556 556 556 556 333 500 278 556 500 722 500 500 500 334 260 334 584", a, " ")
+  for (i = 1; i <= 95; i++) WR[i + 31] = a[i]
+  split("278 333 474 556 556 889 722 238 333 333 389 584 278 333 278 278 556 556 556 556 556 556 556 556 556 556 333 333 584 584 584 611 " \
+        "975 722 722 722 722 667 611 778 722 278 556 722 611 833 722 778 667 778 722 667 611 722 667 944 667 667 611 333 278 333 584 556 " \
+        "333 556 611 556 611 556 333 611 611 278 278 556 278 889 611 611 611 611 389 556 333 611 556 778 556 556 500 389 280 389 584", a, " ")
+  for (i = 1; i <= 95; i++) WB[i + 31] = a[i]
+  npage = 0; nol = 0; nkv = 0; started = 0; indet = 0; nsl = 0
+  new_page()
+}
+
+## ---- low-level drawing --------------------------------------------------------
+function f2(v) { return sprintf("%.2f", v) }
+function put(s) { pc[npage] = pc[npage] s "\n" }
+function new_page() { npage++; pc[npage] = ""; Y = TOPY }
+function need(h) { if (Y - h < BOTY) { new_page(); return 1 } return 0 }
+function text(font, size, x, y, s, col) { if (s != "") put("BT /" font " " f2(size) " Tf " col " rg " f2(x) " " f2(y) " Td (" pstr(s) ") Tj ET") }
+function rtext(font, size, xr, y, s, col) { text(font, size, xr - tw(s, font, size), y, s, col) }
+function box(x, y, w, h, col) { put(col " rg " f2(x) " " f2(y) " " f2(w) " " f2(h) " re f") }
+function rule(xa, xb, y, lw, col) { put(col " RG " f2(lw) " w " f2(xa) " " f2(y) " m " f2(xb) " " f2(y) " l S") }
+
+## PDF string: escape \ ( ), map UTF-8 Latin-1 letters to WinAnsi, other
+## non-ASCII characters become '?'.
+function pstr(s,   out, i, n, c, b, b2, code) {
+  if (s !~ /[\\()\200-\377]/) return s
+  out = ""; n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1); b = ORD[c]
+    if (c == "\\" || c == "(" || c == ")") { out = out "\\" c; continue }
+    if (b < 128) { out = out c; continue }
+    if ((b == 194 || b == 195) && i < n) {
+      b2 = ORD[substr(s, i + 1, 1)]
+      if (b2 >= 128 && b2 < 192) {
+        code = (b == 194) ? b2 : b2 + 64; i++
+        out = out ((code >= 160) ? sprintf("\\%03o", code) : "?"); continue
+      }
+    }
+    if (b >= 192) while (i < n && ORD[substr(s, i + 1, 1)] >= 128 && ORD[substr(s, i + 1, 1)] < 192) i++
+    out = out "?"
+  }
+  return out
+}
+function clen(s,   i, n, k, b) {
+  if (s !~ /[\200-\377]/) return length(s)
+  n = 0; k = length(s)
+  for (i = 1; i <= k; i++) { b = ORD[substr(s, i, 1)]; if (b < 128 || b >= 192) n++ }
+  return n
+}
+function tw(s, font, size,   i, n, w, b) {
+  if (font == "F3" || font == "F4") return clen(s) * 0.6 * size
+  w = 0; n = length(s)
+  for (i = 1; i <= n; i++) {
+    b = ORD[substr(s, i, 1)]
+    if (b >= 128 && b < 192) continue
+    w += (b >= 32 && b <= 126) ? ((font == "F2") ? WB[b] : WR[b]) : 556
+  }
+  return w * size / 1000
+}
+function fit(s, font, size, maxw,   n) {
+  if (tw(s, font, size) <= maxw) return s
+  if (length(s) > 300) s = substr(s, 1, 300)
+  n = length(s)
+  while (n > 0 && tw(substr(s, 1, n) "...", font, size) > maxw) n--
+  while (n > 0 && ORD[substr(s, n + 1, 1)] >= 128 && ORD[substr(s, n + 1, 1)] < 192) n--
+  return substr(s, 1, n) "..."
+}
+function wrap(s, font, size, maxw, out,   words, nw, i, line, cand, k, n) {
+  n = 0; line = ""; nw = split(s, words, " ")
+  for (i = 1; i <= nw; i++) {
+    cand = (line == "") ? words[i] : line " " words[i]
+    if (tw(cand, font, size) <= maxw) { line = cand; continue }
+    if (line != "") { out[++n] = line; line = "" }
+    while (tw(words[i], font, size) > maxw) {
+      for (k = length(words[i]) - 1; k > 1 && tw(substr(words[i], 1, k), font, size) > maxw; k--) ;
+      out[++n] = substr(words[i], 1, k); words[i] = substr(words[i], k + 1)
+    }
+    line = words[i]
+  }
+  if (line != "" || n == 0) out[++n] = line
+  return n
+}
+function outline(level, title) { nol++; olev[nol] = level; otit[nol] = title; opg[nol] = npage; oy[nol] = Y + 20 }
+
+## ---- page header, summary blocks ------------------------------------------------
+function start_doc(   i, x, y, lw, lab, n, lines, h) {
+  started = 1
+  text("F2", 18, X0, Y - 17, title, ACC); Y -= 30
+  x = X0; y = Y
+  for (i = 1; i <= nm; i++) {
+    lab = mlab[i] ": "
+    lw = tw(lab, "F1", 8.5) + tw(mval[i], "F2", 8.5)
+    if (x > X0 && x + lw > X1) { x = X0; y -= 12 }
+    text("F1", 8.5, x, y, lab, MUT); text("F2", 8.5, x + tw(lab, "F1", 8.5), y, mval[i], INK)
+    x += lw + 22
+  }
+  Y = y - 10
+  if (preview != "") {
+    n = wrap(preview, "F3", 7.5, W - 22, lines)
+    if (n > 4) { n = 4; lines[4] = fit(lines[4] " ...", "F3", 7.5, W - 22) }
+    h = 17 + n * 9.6
+    box(X0, Y - h, W, h, SOFT); box(X0, Y - h, 2.5, h, ACC)
+    text("F2", 6.8, X0 + 11, Y - 10, "STATEMENT", MUT)
+    for (i = 1; i <= n; i++) text("F3", 7.5, X0 + 11, Y - 11 - i * 9.6, lines[i], INK)
+    Y -= h + 4
+  }
+}
+
+function block_head(n, t,   bx) {
+  flush_kv()
+  need(70)
+  Y -= 10
+  rule(X0, X1, Y, 1.4, ACC)
+  Y -= 19
+  box(X0, Y - 3.5, 15, 15, ACC)
+  text("F2", 9, X0 + (15 - tw(n, "F2", 9)) / 2, Y + 0.6, n, WHITE)
+  text("F2", 12.5, X0 + 23, Y, t, INK)
+  outline(1, n "  " t)
+  Y -= 8
+}
+
+## Key/value pairs sit in two columns, like the HTML grid. Labels and values
+## both wrap; a row is as tall as its tallest cell.
+function flush_kv(   i, j, cw, lw, vw, x, k, n, nl, rh, lb, vl, cnt) {
+  if (!nkv) return
+  cw = (W - 28) / 2; lw = 150; vw = cw - lw - 8
+  for (i = 1; i <= nkv; i += 2) {
+    rh = 0
+    for (j = 0; j <= 1; j++) {
+      k = i + j; if (k > nkv) break
+      cnt[j, "l"] = wrap(kvl[k], "F2", 8, lw - 6, lb); for (n = 1; n <= cnt[j, "l"]; n++) cl[j, n] = lb[n]
+      cnt[j, "v"] = wrap(kvv[k], "F1", 8.5, vw, vl); for (n = 1; n <= cnt[j, "v"]; n++) cv[j, n] = vl[n]
+      split("", lb); split("", vl)
+      nl = (cnt[j, "l"] > cnt[j, "v"]) ? cnt[j, "l"] : cnt[j, "v"]
+      if (nl * 10.5 + 6 > rh) rh = nl * 10.5 + 6
+    }
+    need(rh)
+    for (j = 0; j <= 1; j++) {
+      k = i + j; if (k > nkv) break
+      x = X0 + j * (cw + 28)
+      for (n = 1; n <= cnt[j, "l"]; n++) text("F2", 8, x, Y - 10.5 - (n - 1) * 10.5, cl[j, n], MUT)
+      for (n = 1; n <= cnt[j, "v"]; n++) text("F1", 8.5, x + lw, Y - 10.5 - (n - 1) * 10.5, cv[j, n], INK)
+      rule(x, x + cw, Y - rh + 0.5, 0.6, RULE)
+    }
+    Y -= rh
+  }
+  nkv = 0
+  Y -= 4
+}
+
+function table_header(   c, x) {
+  box(X0, Y - 14, tabw, 14, SOFT)
+  x = X0
+  for (c = 1; c <= ncol; c++) {
+    if (substr(aligns, c, 1) == "R") rtext("F2", 7.6, x + cwid[c] - 5, Y - 9.8, fit(th[c], "F2", 7.6, cwid[c] - 10), INK)
+    else text("F2", 7.6, x + 5, Y - 9.8, fit(th[c], "F2", 7.6, cwid[c] - 10), INK)
+    x += cwid[c]
+  }
+  rule(X0, X0 + tabw, Y - 14, 0.6, RULE)
+  Y -= 14
+}
+function draw_table(   c, r, w, tot, left, lsum, rsum, f, x, s) {
+  flush_kv()
+  for (c = 1; c <= ncol; c++) {
+    cwid[c] = tw(th[c], "F2", 7.6) + 12
+    for (r = 1; r <= nr; r++) { w = tw(td[r, c], "F1", 7.6) + 12; if (w > cwid[c]) cwid[c] = w }
+    if (cwid[c] > 330) cwid[c] = 330
+  }
+  tot = 0; lsum = 0; rsum = 0
+  for (c = 1; c <= ncol; c++) { tot += cwid[c]; if (substr(aligns, c, 1) == "R") rsum += cwid[c]; else lsum += cwid[c] }
+  if (tot > W && lsum > 0) {
+    f = (W - rsum) / lsum
+    for (c = 1; c <= ncol; c++) if (substr(aligns, c, 1) != "R") { cwid[c] *= f; if (cwid[c] < 36) cwid[c] = 36 }
+  } else if (tot < W) {
+    for (c = 1; c <= ncol; c++) cwid[c] *= W / tot
+  }
+  tabw = 0; for (c = 1; c <= ncol; c++) tabw += cwid[c]
+  need(18 + 14 + 13 * (nr < 3 ? nr : 3))
+  Y -= 4
+  text("F2", 8, X0, Y - 9, caption, MUT)
+  Y -= 14
+  table_header()
+  for (r = 1; r <= nr; r++) {
+    if (need(13)) table_header()
+    x = X0
+    for (c = 1; c <= ncol; c++) {
+      s = fit(td[r, c], "F1", 7.6, cwid[c] - 10)
+      if (substr(aligns, c, 1) == "R") rtext("F1", 7.6, x + cwid[c] - 5, Y - 9.2, s, INK)
+      else text("F1", 7.6, x + 5, Y - 9.2, s, INK)
+      x += cwid[c]
+    }
+    rule(X0, X0 + tabw, Y - 13, 0.5, RULE)
+    Y -= 13
+  }
+  Y -= 8
+}
+
+## ---- full report details ------------------------------------------------------
+function flush_section(   i, maxc, sz, lead, cap, s, font, col, k) {
+  if (!nsl) return
+  maxc = 0
+  for (i = 1; i <= nsl; i++) { k = clen(sl[i]); if (k > maxc) maxc = k }
+  sz = (maxc > 0) ? W / (0.6 * maxc) : 7
+  if (sz > 7) sz = 7
+  if (sz < 5.2) sz = 5.2
+  sz = int(sz * 10) / 10
+  lead = sz * 1.25; cap = int(W / (0.6 * sz))
+  need(26 + 3 * lead)
+  Y -= 12
+  text("F2", 10, X0, Y - 8, stitle, ACC)
+  outline(2, stitle)
+  Y -= 12
+  rule(X0, X1, Y, 0.6, RULE)
+  Y -= 3
+  for (i = 1; i <= nsl; i++) {
+    font = (st[i] == "H") ? "F4" : "F3"; col = (st[i] == "U") ? FAINT : INK
+    s = sl[i]
+    do {
+      need(lead)
+      Y -= lead
+      if (clen(s) > cap) { k = cut_at(s, cap); text(font, sz, X0, Y + 1.5, substr(s, 1, k), col); s = "  " substr(s, k + 1) }
+      else { text(font, sz, X0, Y + 1.5, s, col); s = "" }
+    } while (s != "")
+  }
+  nsl = 0
+}
+function cut_at(s, cap,   i, n, b) {   # byte position after 'cap' visible characters
+  if (s !~ /[\200-\377]/) return cap
+  n = 0
+  for (i = 1; i <= length(s); i++) { b = ORD[substr(s, i, 1)]; if (b < 128 || b >= 192) { if (n == cap) return i - 1; n++ } }
+  return length(s)
+}
+
+## ---- model records --------------------------------------------------------------
+$1 == "TITLE"   { title = $2; next }
+$1 == "META"    { nm++; mlab[nm] = $2; mval[nm] = $3; if ($2 == "Statement hash") hash = $3; next }
+$1 == "PREVIEW" { preview = $2; next }
+$1 == "BLOCK"   { if (!started) start_doc(); block_head($2, $3); next }
+$1 == "KV"      { nkv++; kvl[nkv] = $2; kvv[nkv] = $3; next }
+$1 == "NOTE"    { flush_kv(); need(16); text("F1", 8.5, X0, Y - 11, $2, MUT); Y -= 18; next }
+$1 == "TABLE"   { flush_kv(); caption = $2; aligns = $3; ncol = NF - 3; for (c = 1; c <= ncol; c++) th[c] = $(c + 3); nr = 0; next }
+$1 == "ROW"     { nr++; for (c = 1; c <= ncol; c++) td[nr, c] = $(c + 1); next }
+$1 == "ENDTABLE" { draw_table(); next }
+$1 == "DETAILS" {
+  if (!started) start_doc()
+  flush_kv(); if (pc[npage] != "") new_page(); indet = 1
+  text("F2", 15, X0, Y - 14, "Full report details", ACC)
+  outline(1, "Full report details")
+  Y -= 22; rule(X0, X1, Y, 1.4, ACC); Y -= 2
+  next
+}
+$1 == "SECTION" { flush_section(); stitle = $2; next }
+$1 == "HDR"     { nsl++; sl[nsl] = substr($0, 5); st[nsl] = "H"; next }
+$1 == "UL"      { nsl++; sl[nsl] = substr($0, 4); st[nsl] = "U"; next }
+$1 == "LINE"    { nsl++; sl[nsl] = substr($0, 6); st[nsl] = "L"; next }
+
+## ---- write the file -----------------------------------------------------------------
+function emit(s) { printf "%s", s; pos += length(s) }
+function obj(n, body) { off[n] = pos; emit(n " 0 obj\n" body "\nendobj\n") }
+
+END {
+  if (!started) start_doc()
+  flush_kv(); flush_section()
+
+  for (p = 1; p <= npage; p++) {          # footer on every page
+    s = "Page " p " of " npage
+    pc[p] = pc[p] RULE " RG 0.6 w " f2(X0) " 40 m " f2(X1) " 40 l S\n"
+    pc[p] = pc[p] "BT /F1 7 Tf " MUT " rg " f2(X0) " 29 Td (" pstr(fit(footer, "F1", 7, W - 90)) ") Tj ET\n"
+    pc[p] = pc[p] "BT /F1 7 Tf " MUT " rg " f2(X1 - tw(s, "F1", 7)) " 29 Td (" s ") Tj ET\n"
+  }
+
+  ## objects: 1 catalog, 2 pages, 3 outline root, 4-7 fonts, 8 info,
+  ## then page/content pairs, then outline items
+  PG0 = 8; OL0 = 8 + 2 * npage
+  emit("%PDF-1.4\n%\342\343\317\323\n")
+  obj(1, "<< /Type /Catalog /Pages 2 0 R" (nol ? " /Outlines 3 0 R /PageMode /UseOutlines" : "") " >>")
+  kids = ""
+  for (p = 1; p <= npage; p++) kids = kids (p > 1 ? " " : "") (PG0 + 2 * p - 1) " 0 R"
+  obj(2, "<< /Type /Pages /Count " npage " /Kids [" kids "] /MediaBox [0 0 " PW " " PH "]" \
+         " /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R >> >> >>")
+
+  ## outline tree: level-1 entries under the root, level-2 under the last level-1
+  top = 0; last1 = 0
+  for (k = 1; k <= nol; k++) {
+    if (olev[k] == 1 || !last1) { par[k] = 0; last1 = k; top++ } else par[k] = last1
+    if (!first[par[k]]) first[par[k]] = k
+    if (lastc[par[k]]) { nxt[lastc[par[k]]] = k; prv[k] = lastc[par[k]] }
+    lastc[par[k]] = k; cnt[par[k]]++
+  }
+  obj(3, "<< /Type /Outlines" (nol ? " /First " (OL0 + first[0]) " 0 R /Last " (OL0 + lastc[0]) " 0 R" : "") " /Count " top " >>")
+
+  split("Helvetica Helvetica-Bold Courier Courier-Bold", fn, " ")
+  for (k = 1; k <= 4; k++) obj(3 + k, "<< /Type /Font /Subtype /Type1 /BaseFont /" fn[k] " /Encoding /WinAnsiEncoding >>")
+  obj(8, "<< /Title (" pstr(title (hash != "" ? " - " hash : "")) ") /Producer (hana_dbop_comparison data_collector)" \
+         (created != "" ? " /CreationDate (D:" created ")" : "") " >>")
+
+  for (p = 1; p <= npage; p++) {
+    c = pc[p]; sub(/\n$/, "", c)
+    obj(PG0 + 2 * p - 1, "<< /Type /Page /Parent 2 0 R /Contents " (PG0 + 2 * p) " 0 R >>")
+    obj(PG0 + 2 * p, "<< /Length " length(c) " >>\nstream\n" c "\nendstream")
+  }
+  for (k = 1; k <= nol; k++) {
+    body = "<< /Title (" pstr(otit[k]) ") /Parent " (par[k] ? OL0 + par[k] : 3) " 0 R" \
+           " /Dest [" (PG0 + 2 * opg[k] - 1) " 0 R /XYZ 0 " f2(oy[k] > PH ? PH : oy[k]) " 0]"
+    if (prv[k]) body = body " /Prev " (OL0 + prv[k]) " 0 R"
+    if (nxt[k]) body = body " /Next " (OL0 + nxt[k]) " 0 R"
+    if (first[k]) body = body " /First " (OL0 + first[k]) " 0 R /Last " (OL0 + lastc[k]) " 0 R /Count -" cnt[k]
+    obj(OL0 + k, body " >>")
+  }
+
+  nobj = OL0 + nol
+  xref = pos
+  emit("xref\n0 " (nobj + 1) "\n0000000000 65535 f \n")
+  for (k = 1; k <= nobj; k++) emit(sprintf("%010d 00000 n \n", off[k]))
+  emit("trailer\n<< /Size " (nobj + 1) " /Root 1 0 R /Info 8 0 R >>\nstartxref\n" xref "\n%%EOF\n")
+}
+AWKPDFEOF
+
+## --- render this hash's report ------------------------------------------------
+## Old files of the same name are removed first, so the publish block below can
+## never pick up a report that this run did not produce.
+rm -f "${HTML_OUTPUT}" "${PDF_OUTPUT}" "${MODEL_FILE}"
+
+case "${REPORT_FORMAT}" in
+  html|pdf|both|none) ;;
+  *) echo "WARNING: REPORT_FORMAT='${REPORT_FORMAT}' is not html, pdf, both or none - using both" >&2
+     REPORT_FORMAT="both" ;;
+esac
+case "${PDF_ENGINE}" in
+  auto|awk|none) ;;
+  *) echo "NOTE: PDF_ENGINE='${PDF_ENGINE}' is not used any more - the built-in awk renderer makes the PDF" >&2 ;;
+esac
+
+if [[ "${REPORT_FORMAT}" != "none" ]]; then
+  if ! "${AWK_BIN}" -f "${AWK_CLEAN}" "${OUTPUT_FILE}" > "${CLEAN_TXT}"; then
+    echo "WARNING: could not convert ${OUTPUT_FILE} to text - no HTML/PDF report for ${statement_hash}" >&2
+  elif ! "${AWK_BIN}" -v stmt_hash="${statement_hash}" -f "${AWK_MODEL}" "${CLEAN_TXT}" > "${MODEL_FILE}"; then
+    echo "WARNING: could not lay out the report for ${statement_hash} - no HTML/PDF report" >&2
+  else
+    if [[ "${REPORT_FORMAT}" == "html" || "${REPORT_FORMAT}" == "both" ]]; then
+      if REPORT_FOOTER="${FOOTER_TEXT}" "${AWK_BIN}" -f "${AWK_HTML}" "${MODEL_FILE}" > "${HTML_OUTPUT}" &&
+         [[ -s "${HTML_OUTPUT}" ]]; then
+        echo "HTML report written to ${HTML_OUTPUT}"
+      else
+        rm -f "${HTML_OUTPUT}"
+        echo "WARNING: HTML rendering failed for ${statement_hash}" >&2
+      fi
+    fi
+    if [[ "${REPORT_FORMAT}" == "pdf" || "${REPORT_FORMAT}" == "both" ]]; then
+      if [[ "${PDF_ENGINE}" == "none" ]]; then
+        echo "NOTE: PDF_ENGINE=none - no PDF report for ${statement_hash}" >&2
+      elif LC_ALL=C REPORT_FOOTER="${FOOTER_TEXT}" REPORT_CREATED="$(date +%Y%m%d%H%M%S)" \
+             "${AWK_BIN}" -f "${AWK_PDF}" "${MODEL_FILE}" > "${PDF_OUTPUT}" && [[ -s "${PDF_OUTPUT}" ]]; then
+        echo "PDF report written to ${PDF_OUTPUT}"
+      else
+        rm -f "${PDF_OUTPUT}"
+        echo "WARNING: PDF rendering failed for ${statement_hash}" >&2
+      fi
+    fi
+  fi
+  rm -f "${MODEL_FILE}"
+fi
 
 ## --- publish this hash's report paths into slot N (1..10) ------------------
+## --- and queue the files for Threads_HTML.zip / Threads_PDF.zip ------------
 if [[ -s "${HTML_OUTPUT}" ]]; then
   printf -v "htmlReportPath${hash_idx}" '%s' "${HTML_OUTPUT}"
+  HTML_FILES+=("${HTML_OUTPUT}")
 fi
 if [[ -s "${PDF_OUTPUT}" ]]; then
   printf -v "pdfReportPath${hash_idx}" '%s' "${PDF_OUTPUT}"
+  PDF_FILES+=("${PDF_OUTPUT}")
 fi
 
 ## The version probe only needs to run once per script invocation.
@@ -3449,6 +4315,52 @@ done
 ## ===========================================================================
 ## End of per-hash loop
 ## ===========================================================================
+
+## ===========================================================================
+## Bundle the reports of this run: every PDF goes into Threads_PDF.zip and
+## every HTML into Threads_HTML.zip, both in ${script_dir}. The individual
+## files stay where they are, so the htmlReportPathN / pdfReportPathN markers
+## still point at real files. The zip names are fixed, so each run replaces
+## the pair from the previous run. Uses zip when it is installed, otherwise
+## Python's built-in zipfile module; as with the rendering steps, a failure
+## here is only a warning.
+## ===========================================================================
+HTML_ZIP="${script_dir}/Threads_HTML.zip"
+PDF_ZIP="${script_dir}/Threads_PDF.zip"
+
+zip_reports() {   ## usage: zip_reports <archive> <file>...
+  local archive="$1" zip_rc=0 py=""
+  shift
+  ## Always start from scratch: zip adds to an existing archive, and a zip
+  ## left over from an earlier run must never look like this run's result.
+  rm -f "${archive}"
+  if [[ $# -eq 0 ]]; then
+    echo "NOTE: no reports to bundle - ${archive##*/} not created" >&2
+    return 1
+  fi
+  if command -v zip >/dev/null 2>&1; then
+    zip -q -j "${archive}" "$@" >&2 || zip_rc=$?    ## -j: bare file names, no directories
+  else
+    for py in python3 python; do
+      command -v "${py}" >/dev/null 2>&1 && break
+      py=""
+    done
+    if [[ -z "${py}" ]]; then
+      echo "WARNING: neither zip nor python is available - ${archive##*/} not created" >&2
+      return 1
+    fi
+    "${py}" -m zipfile -c "${archive}" "$@" >&2 || zip_rc=$?
+  fi
+  if [[ ${zip_rc} -ne 0 || ! -s "${archive}" ]]; then
+    rm -f "${archive}"
+    echo "WARNING: could not create ${archive} (rc=${zip_rc})" >&2
+    return 1
+  fi
+  echo "Zipped $# report(s) into ${archive}"
+}
+
+zip_reports "${HTML_ZIP}" "${HTML_FILES[@]}" && htmlZipPath="${HTML_ZIP}"
+zip_reports "${PDF_ZIP}"  "${PDF_FILES[@]}"  && pdfZipPath="${PDF_ZIP}"
 
 echo
 [[ -n "${statementHash1}"   ]] && echo "##gbStart##statementHash1##splitKeyValue##${statementHash1}##splitKeyValue##string##gbEnd##"
@@ -3481,6 +4393,8 @@ echo
 [[ -n "${statementHash10}"  ]] && echo "##gbStart##statementHash10##splitKeyValue##${statementHash10}##splitKeyValue##string##gbEnd##"
 [[ -n "${htmlReportPath10}" ]] && echo "##gbStart##htmlReportPath10##splitKeyValue##${htmlReportPath10}##splitKeyValue##string##gbEnd##"
 [[ -n "${pdfReportPath10}"  ]] && echo "##gbStart##pdfReportPath10##splitKeyValue##${pdfReportPath10}##splitKeyValue##string##gbEnd##"
+[[ -n "${htmlZipPath}"      ]] && echo "##gbStart##htmlZipPath##splitKeyValue##${htmlZipPath}##splitKeyValue##string##gbEnd##"
+[[ -n "${pdfZipPath}"       ]] && echo "##gbStart##pdfZipPath##splitKeyValue##${pdfZipPath}##splitKeyValue##string##gbEnd##"
 
 if [[ ${failed_count} -gt 0 ]]; then
   echo "WARNING: ${failed_count} of ${hash_total} statement hash(es) failed - see the messages above." >&2
